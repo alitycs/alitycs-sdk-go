@@ -211,3 +211,179 @@ func TestBackoffDelaySchedule(t *testing.T) {
 		}
 	}
 }
+
+func TestTransportHonoursRetryAfterSeconds(t *testing.T) {
+	var attempts atomic.Int32
+	var firstBody, secondBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if attempts.Add(1) == 1 {
+			firstBody = body
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		secondBody = body
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	tr := newTestTransport(t, server.URL, 3)
+	var waits []time.Duration
+	tr.sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if err := tr.send(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("send after 429+Retry-After: %v", err)
+	}
+	if len(waits) != 1 || waits[0] < 2*time.Second {
+		t.Fatalf("waits = %v, want the full Retry-After of 2s honoured", waits)
+	}
+	// Only timing changes between attempts: the redelivered batch is byte-identical.
+	if string(firstBody) != string(secondBody) {
+		t.Errorf("retry must resend the identical payload:\n%s\n%s", firstBody, secondBody)
+	}
+}
+
+func TestTransportHonoursRetryAfterHTTPDate(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", time.Now().Add(3*time.Second).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	tr := newTestTransport(t, server.URL, 3)
+	var waits []time.Duration
+	tr.sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if err := tr.send(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("send after 429+Retry-After date: %v", err)
+	}
+	if len(waits) != 1 || waits[0] < 2*time.Second || waits[0] > 3*time.Second {
+		// http.TimeFormat has second precision, so formatting now+3s truncates the
+		// sub-second part and the honoured wait lands anywhere in (2s, 3s].
+		t.Fatalf("waits = %v, want ~3s derived from the HTTP-date", waits)
+	}
+}
+
+func TestTransportCapsRetryAfterAtMaxBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	tr := newTestTransport(t, server.URL, 3)
+	var waits []time.Duration
+	tr.sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if err := tr.send(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if len(waits) != 1 || waits[0] != maxBackoff {
+		t.Fatalf("waits = %v, want a single wait capped at %s", waits, maxBackoff)
+	}
+}
+
+func TestTransportRetryAfterAppliesOnlyToTheNextAttempt(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch attempts.Add(1) {
+		case 1:
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+		case 2:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer server.Close()
+
+	tr := newTestTransport(t, server.URL, 3)
+	tr.backoff = func(int) time.Duration { return 7 * time.Second } // deterministic fallback
+	var waits []time.Duration
+	tr.sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+
+	if err := tr.send(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if len(waits) != 2 {
+		t.Fatalf("waits = %v, want two", waits)
+	}
+	if waits[0] < 2*time.Second {
+		t.Errorf("first wait = %s, want the Retry-After of at least 2s (not the 7s schedule)", waits[0])
+	}
+	// The second retry follows a 500, so the Retry-After no longer applies and the
+	// default schedule returns.
+	if waits[1] != 7*time.Second {
+		t.Errorf("second wait = %s, want the 7s default schedule", waits[1])
+	}
+}
+
+// jitteredBounds returns the ±20% window jitter() may produce for a delay.
+type jitterBounds struct{ min, max time.Duration }
+
+func jitteredBounds(d time.Duration) jitterBounds {
+	return jitterBounds{min: time.Duration(float64(d) * 0.8), max: time.Duration(float64(d) * 1.2)}
+}
+
+func TestProductionBackoffIsJitteredWithinTwentyPercent(t *testing.T) {
+	tr := &transport{}
+	for attempt := 1; attempt <= 5; attempt++ {
+		base := backoffDelay(attempt)
+		bounds := jitteredBounds(base)
+		for i := 0; i < 200; i++ {
+			got := tr.delayFor(attempt)
+			if got < bounds.min || got > bounds.max {
+				t.Fatalf("delayFor(%d) = %s, want within [%s, %s]", attempt, got, bounds.min, bounds.max)
+			}
+		}
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+
+	if _, ok := parseRetryAfter("", now); ok {
+		t.Error("empty header must not be treated as a suggestion")
+	}
+	if _, ok := parseRetryAfter("soon", now); ok {
+		t.Error("garbage header must not be treated as a suggestion")
+	}
+	if got, ok := parseRetryAfter("120", now); !ok || got != 120*time.Second {
+		t.Errorf("delta-seconds = %s (%v), want 2m0s", got, ok)
+	}
+	if got, ok := parseRetryAfter("-5", now); !ok || got != 0 {
+		t.Errorf("negative delta-seconds = %s, want clamped to zero", got)
+	}
+	past := now.Add(-time.Minute).Format(http.TimeFormat)
+	if got, ok := parseRetryAfter(past, now); !ok || got != 0 {
+		t.Errorf("past HTTP-date = %s, want zero", got)
+	}
+	future := now.Add(90 * time.Second).Format(http.TimeFormat)
+	if got, ok := parseRetryAfter(future, now); !ok || got < 89*time.Second || got > 90*time.Second {
+		t.Errorf("future HTTP-date = %s, want ~90s", got)
+	}
+}

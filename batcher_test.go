@@ -59,7 +59,7 @@ func TestBatcherSizeTriggerSendsAtThreshold(t *testing.T) {
 	go b.loop()
 	defer func() { b.stop(); <-b.doneCh }()
 
-	if !b.enqueue(testEvent("one")) || !b.enqueue(testEvent("two")) {
+	if !b.enqueue(testEvent("one"), context.Background()) || !b.enqueue(testEvent("two"), context.Background()) {
 		t.Fatal("enqueue rejected within budget")
 	}
 
@@ -76,7 +76,7 @@ func TestBatcherExplicitFlushDrainsPartialGroup(t *testing.T) {
 	go b.loop()
 	defer func() { b.stop(); <-b.doneCh }()
 
-	b.enqueue(testEvent("partial"))
+	b.enqueue(testEvent("partial"), context.Background())
 	if err := b.flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestBatcherTimerFlushesPartialGroup(t *testing.T) {
 	go b.loop()
 	defer func() { b.stop(); <-b.doneCh }()
 
-	b.enqueue(testEvent("timed"))
+	b.enqueue(testEvent("timed"), context.Background())
 	waitForBatches(t, sender, 1)
 }
 
@@ -111,7 +111,7 @@ func TestBatcherStopDeliversEverythingInChunks(t *testing.T) {
 	b := newTestBatcher(3, 100, sender.send)
 	b.start()
 	for i := 0; i < total; i++ {
-		if !b.enqueue(testEvent("evt")) {
+		if !b.enqueue(testEvent("evt"), context.Background()) {
 			t.Fatal("enqueue rejected within budget")
 		}
 	}
@@ -136,11 +136,11 @@ func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	sender := &fakeSend{}
 	b := newTestBatcher(100, 2, sender.send) // no loop started: nothing drains
 
-	if !b.enqueue(testEvent("a")) || !b.enqueue(testEvent("b")) {
+	if !b.enqueue(testEvent("a"), context.Background()) || !b.enqueue(testEvent("b"), context.Background()) {
 		t.Fatal("first two enqueues must fit the budget")
 	}
 	for i := 0; i < 3; i++ {
-		if b.enqueue(testEvent("c")) {
+		if b.enqueue(testEvent("c"), context.Background()) {
 			t.Fatal("enqueue beyond budget succeeded")
 		}
 	}
@@ -158,7 +158,7 @@ func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	if err := b.sendChunk(context.Background(), b.pending[:1]); err != nil {
 		t.Fatalf("sendChunk: %v", err)
 	}
-	if !b.enqueue(testEvent("d")) {
+	if !b.enqueue(testEvent("d"), context.Background()) {
 		t.Fatal("enqueue after a resolved outcome should fit")
 	}
 }
@@ -167,7 +167,7 @@ func TestBatcherWaitDoneReportsResult(t *testing.T) {
 	sender := &fakeSend{err: errors.New("endpoint down")}
 	b := newTestBatcher(2, 100, sender.send)
 	b.start()
-	if !b.enqueue(testEvent("x")) || !b.enqueue(testEvent("y")) {
+	if !b.enqueue(testEvent("x"), context.Background()) || !b.enqueue(testEvent("y"), context.Background()) {
 		t.Fatal("enqueue rejected within budget")
 	}
 	b.stop()
@@ -187,8 +187,8 @@ func TestBatcherWaitDoneReportsResult(t *testing.T) {
 func TestBatcherWaitDoneHonoursContextCancellation(t *testing.T) {
 	sender := &fakeSend{block: make(chan struct{})}
 	b := newTestBatcher(2, 100, sender.send)
-	b.enqueue(testEvent("x"))
-	b.enqueue(testEvent("y")) // size trigger fires and blocks inside the send
+	b.enqueue(testEvent("x"), context.Background())
+	b.enqueue(testEvent("y"), context.Background()) // size trigger fires and blocks inside the send
 	b.start()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -235,4 +235,125 @@ func waitForBatches(t *testing.T, sender *fakeSend, n int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d batches; have %d", n, len(sender.batches()))
+}
+
+// TestBatcherSendPendingChunksByFlushSize pins the chunking contract: the
+// timer and explicit-flush paths must send flushSize-sized batches instead of
+// draining everything queued into one payload.
+func TestBatcherSendPendingChunksByFlushSize(t *testing.T) {
+	sender := &fakeSend{}
+	b := newTestBatcher(3, 100, sender.send)
+	go b.loop()
+	defer func() { b.stop(); <-b.doneCh }()
+
+	const total = 7 // 3 + 3 + 1: the final chunk may be smaller
+	for i := 0; i < total; i++ {
+		if !b.enqueue(testEvent("evt"), context.Background()) {
+			t.Fatal("enqueue rejected within budget")
+		}
+	}
+	if err := b.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	batches := sender.batches()
+	if got := len(batches); got != 3 {
+		t.Fatalf("flush produced %d batches, want 3 chunks of flushSize 3", got)
+	}
+	delivered := 0
+	for i, batch := range batches {
+		limit := 3
+		if i == len(batches)-1 {
+			limit = 1
+		}
+		if len(batch.Events) > 3 || (i < 2 && len(batch.Events) != limit) {
+			t.Fatalf("batch %d holds %d events, want exactly %d", i, len(batch.Events), limit)
+		}
+		delivered += len(batch.Events)
+	}
+	if delivered != total {
+		t.Fatalf("chunks delivered %d of %d events", delivered, total)
+	}
+}
+
+// TestBatcherWholeBatch400SplitsAndDeliversSingles mirrors the server contract:
+// an HTTP 400 rejects the entire batch over a single invalid event, so the
+// batcher splits in half and retries until valid singles land.
+func TestBatcherWholeBatch400SplitsAndDeliversSingles(t *testing.T) {
+	sender := &fakeSend{}
+	send := func(ctx context.Context, payload *BatchPayload) error {
+		if err := sender.send(ctx, payload); err != nil {
+			return err
+		}
+		if len(payload.Events) > 1 {
+			return &terminalStatusError{status: batchRejectStatus} // whole-batch rejection
+		}
+		return nil
+	}
+	b := newTestBatcher(100, 100, send)
+	go b.loop()
+	defer func() { b.stop(); <-b.doneCh }()
+
+	names := []string{"a", "b", "c", "d"}
+	for _, name := range names {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatal("enqueue rejected within budget")
+		}
+	}
+	if err := b.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	batches := sender.batches()
+	sizes := make([]int, 0, len(batches))
+	var singles []string
+	for _, batch := range batches {
+		sizes = append(sizes, len(batch.Events))
+		if len(batch.Events) == 1 {
+			singles = append(singles, batch.Events[0].Event)
+		}
+	}
+	if len(batches) != 7 {
+		t.Fatalf("got %d batches (%v), want the full split: one 4-event batch, two 2s, four 1s", len(batches), sizes)
+	}
+	wantShapes := []int{4, 2, 1, 1, 2, 1, 1}
+	for i, want := range wantShapes {
+		if sizes[i] != want {
+			t.Fatalf("batch shapes %v, want %v", sizes, wantShapes)
+		}
+	}
+	// Recursion visits halves left-to-right, so accepted singles keep queue order.
+	if len(singles) != 4 {
+		t.Fatalf("got %d singles (%v), want 4", len(singles), singles)
+	}
+	for i, name := range names {
+		if singles[i] != name {
+			t.Fatalf("singles = %v, want queue order %v", singles, names)
+		}
+	}
+	counters := b.counters()
+	if counters.Delivered != 4 || counters.Failed != 0 {
+		t.Fatalf("counters = %+v, want 4 delivered and none failed", counters)
+	}
+}
+
+func TestBatcherLocalRejectionSurfacesInStatsAndShutdown(t *testing.T) {
+	sender := &fakeSend{}
+	b := newTestBatcher(100, 100, sender.send)
+
+	b.reject("too_big", errors.New("value exceeds 1000 characters"))
+
+	if counters := b.counters(); counters.Rejected != 1 {
+		t.Fatalf("counters = %+v, want Rejected=1", counters)
+	}
+	b.start()
+	b.stop()
+	err := b.waitDone(context.Background())
+	var lost *LostEventsError
+	if !errors.As(err, &lost) {
+		t.Fatalf("waitDone = %v, want LostEventsError for the locally rejected event", err)
+	}
+	if lost.Rejected != 1 {
+		t.Fatalf("LostEventsError.Rejected = %d, want 1", lost.Rejected)
+	}
 }

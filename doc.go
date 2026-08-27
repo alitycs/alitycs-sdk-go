@@ -24,6 +24,38 @@
 // describing how many events may not have arrived rather than silently
 // dropping them.
 //
+// # Local ingestion limits
+//
+// The ingest endpoint validates every event against canonical limits (≤50
+// properties per event, keys ≤100 chars, values ≤1000 chars, estimated size
+// ≤64KB, a non-blank name plus userId or anonymousId, epoch-millisecond
+// timestamps no older than 7 days and never in the future) and rejects an
+// entire batch over a single violating event. This SDK therefore enforces the
+// same limits at build time: an offending event is rejected locally — never
+// queued, never sent, never truncated — surfaced through a warn-level log
+// (never debug-gated), Stats().Rejected, and Shutdown's LostEventsError.
+// Revenue payloads reject cross-kind fields exactly like the server.
+//
+// # Delivery behaviour
+//
+// Timer- and flush-triggered dispatch sends flushSize-sized chunks instead of
+// one giant payload. When the server answers HTTP 400 — a whole-batch
+// rejection — the batch is split in half and each half retried recursively so
+// valid events still land. Retries reuse the identical marshalled body so a
+// batch keeps its batchId for server-side dedup.
+//
+// # Contexts
+//
+// Every enqueueing call carries its ctx into the SDK: when that call completes
+// a full batch, the size-triggered send runs under it, so cancelling or
+// deadline-expiring ctx aborts the dispatch — the affected events count as
+// failed deliveries (Stats().Failed, Shutdown's LostEventsError). Flush bounds
+// both its wait and the sends its drain performs the same way. Timer-driven
+// dispatch and the shutdown drain deliberately run on a fresh background
+// context so background flushing stays immune to unrelated cancellations;
+// pass context.Background() from enqueueing calls whose lifetime should not
+// bound delivery.
+//
 // The capability surface is intentionally limited to what Alitycs offers:
 // track, identify/reset, page, error capture, revenue ingestion, global
 // properties, and flush/shutdown. Feature flags, session recording, group

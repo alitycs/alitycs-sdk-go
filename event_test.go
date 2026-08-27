@@ -89,6 +89,34 @@ func TestRevenueValidationFailures(t *testing.T) {
 			n := -1
 			return Revenue{Version: 1, Kind: KindMRRBaselineComplete, FactID: "f", Currency: "USD", ExpectedActiveSubscriptions: &n}
 		}()},
+		// Per-kind exclusivity mirrors the server: foreign fields are rejected.
+		{"transaction with subscriptionId", Revenue{Version: 1, Kind: KindTransaction, FactID: "f", Amount: "1.00", Currency: "USD", SubscriptionID: "s"}},
+		{"transaction with mrrAmount", Revenue{Version: 1, Kind: KindTransaction, FactID: "f", Amount: "1.00", Currency: "USD", MRRAmount: "5.00"}},
+		{"transaction with expectedActiveSubscriptions", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindTransaction, FactID: "f", Amount: "1.00", Currency: "USD", ExpectedActiveSubscriptions: &n}
+		}()},
+		{"snapshot with amount", Revenue{Version: 1, Kind: KindMRRSnapshot, FactID: "f", SubscriptionID: "s", CustomerID: "c", MRRAmount: "5.00", Currency: "USD", Amount: "1.00"}},
+		{"snapshot with expectedActiveSubscriptions", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindMRRSnapshot, FactID: "f", SubscriptionID: "s", CustomerID: "c", MRRAmount: "5.00", Currency: "USD", ExpectedActiveSubscriptions: &n}
+		}()},
+		{"baseline with amount", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindMRRBaselineComplete, FactID: "f", Currency: "USD", ExpectedActiveSubscriptions: &n, Amount: "1.00"}
+		}()},
+		{"baseline with mrrAmount", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindMRRBaselineComplete, FactID: "f", Currency: "USD", ExpectedActiveSubscriptions: &n, MRRAmount: "5.00"}
+		}()},
+		{"baseline with subscriptionId", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindMRRBaselineComplete, FactID: "f", Currency: "USD", ExpectedActiveSubscriptions: &n, SubscriptionID: "s"}
+		}()},
+		{"baseline with customerId", func() Revenue {
+			n := 3
+			return Revenue{Version: 1, Kind: KindMRRBaselineComplete, FactID: "f", Currency: "USD", ExpectedActiveSubscriptions: &n, CustomerID: "c"}
+		}()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,7 +165,10 @@ func TestSerializePropsToStringValues(t *testing.T) {
 		"slice":   []string{"x", "y"},
 		"channel": make(chan int),
 	}
-	got := serializeProps(props)
+	got, err := serializeProps(props)
+	if err != nil {
+		t.Fatalf("serializeProps: %v", err)
+	}
 
 	if len(got) != len(props)-1 {
 		t.Fatalf("serializeProps produced %d keys (%v), want %d with nil skipped", len(got), got, len(props)-1)

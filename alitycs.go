@@ -68,25 +68,34 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 
 // Track queues a track event. The call never blocks on network I/O; use Flush
 // or Shutdown to guarantee delivery. An empty event name is dropped.
+//
+// The context travels with the event: when this call completes a full batch
+// (the queue reaches the flush size), that send runs under ctx — cancelling
+// it aborts the batch as failed deliveries. Pass context.Background() unless
+// the caller's lifetime should bound delivery; see "Delivery behaviour" in
+// the package documentation.
 func (c *Client) Track(ctx context.Context, eventName string, properties Props, opts ...EventOption) {
-	c.enqueue(eventTypeTrack, eventName, properties, nil, opts)
+	c.enqueue(ctx, eventTypeTrack, eventName, properties, nil, opts)
 }
 
-// CaptureError queues an error event. An empty error name is dropped.
+// CaptureError queues an error event. An empty error name is dropped. Like
+// Track, it carries ctx into any size-triggered send this call completes.
 func (c *Client) CaptureError(ctx context.Context, errorName string, properties Props, opts ...EventOption) {
-	c.enqueue(eventTypeError, errorName, properties, nil, opts)
+	c.enqueue(ctx, eventTypeError, errorName, properties, nil, opts)
 }
 
 // Page queues a page view event. An empty name falls back to "page_view".
+// Like Track, it carries ctx into any size-triggered send this call completes.
 func (c *Client) Page(ctx context.Context, name string, properties Props, opts ...EventOption) {
 	if len(name) == 0 {
 		name = "page_view"
 	}
-	c.enqueue(eventTypePage, name, properties, nil, opts)
+	c.enqueue(ctx, eventTypePage, name, properties, nil, opts)
 }
 
 // Identify marks the session as belonging to userID and queues an identify
-// event carrying the traits. An empty userID is ignored.
+// event carrying the traits. An empty userID is ignored. Like Track, it
+// carries ctx into any size-triggered send this call completes.
 func (c *Client) Identify(ctx context.Context, userID string, traits Props) {
 	if userID == "" {
 		debugLog(c.config.debug, "identify ignored: userId is required")
@@ -99,20 +108,21 @@ func (c *Client) Identify(ctx context.Context, userID string, traits Props) {
 		properties[key] = value
 	}
 	properties["userId"] = userID
-	c.enqueue(eventTypeIdentify, "identify", properties, nil, nil)
+	c.enqueue(ctx, eventTypeIdentify, "identify", properties, nil, nil)
 }
 
 // TrackRevenue queues a trusted revenue event. The payload must be valid —
 // build it with NewTransaction, NewMRRSnapshot or NewMRRBaselineComplete, or
-// call Validate on a hand-built Revenue first; invalid payloads are dropped
-// and reported through debug logging.
+// call Validate on a hand-built Revenue first; invalid payloads are rejected
+// locally (warn log + Stats.Rejected), never queued. Like Track, it carries
+// ctx into any size-triggered send this call completes.
 func (c *Client) TrackRevenue(ctx context.Context, revenue Revenue, properties Props, opts ...EventOption) {
 	if err := revenue.Validate(); err != nil {
-		debugLog(c.config.debug, "revenue event dropped: %v", err)
+		c.batch.reject("revenue_"+revenue.Kind, err)
 		return
 	}
 	eventName := "revenue_" + revenue.Kind
-	c.enqueue(eventTypeTrack, eventName, properties, &revenue, opts)
+	c.enqueue(ctx, eventTypeTrack, eventName, properties, &revenue, opts)
 }
 
 // SetGlobalProperties merges properties into every subsequently enqueued
@@ -153,8 +163,9 @@ func (c *Client) Reset() {
 }
 
 // Flush waits until every event enqueued before this call has been accepted by
-// the endpoint, honouring ctx. It reports the first terminal failure if a
-// batch exhausted its retries.
+// the endpoint, honouring ctx: it bounds both the wait and the sends the drain
+// performs — cancelling ctx aborts those sends. It reports the first terminal
+// failure if a batch exhausted its retries.
 func (c *Client) Flush(ctx context.Context) error {
 	return c.batch.flush(ctx)
 }
@@ -179,8 +190,8 @@ func (c *Client) Shutdown(ctx context.Context) error {
 }
 
 // Stats reports delivery counters: events accepted into the queue, confirmed
-// delivered by the endpoint, dropped because the queue was full, and lost to
-// exhausted retries.
+// delivered by the endpoint, dropped because the queue was full, rejected
+// locally for violating ingestion limits, and lost to exhausted retries.
 func (c *Client) Stats() Stats {
 	counters := c.batch.counters()
 	return Stats(counters)
@@ -191,6 +202,7 @@ type Stats struct {
 	Enqueued  int64
 	Delivered int64
 	Dropped   int64
+	Rejected  int64
 	Failed    int64
 }
 
@@ -207,9 +219,10 @@ func (e *UndeliveredError) Error() string {
 
 func (e *UndeliveredError) Unwrap() error { return e.Cause }
 
-// enqueue builds the wire event and hands it to the batcher. Holding stateMu
-// across the enqueue means every event accepted precedes the shutdown signal.
-func (c *Client) enqueue(eventType eventType, eventName string, properties Props, revenue *Revenue, opts []EventOption) {
+// enqueue builds the wire event and hands it to the batcher under the
+// enqueuing call's ctx (nil means background). Holding stateMu across the
+// enqueue means every event accepted precedes the shutdown signal.
+func (c *Client) enqueue(ctx context.Context, eventType eventType, eventName string, properties Props, revenue *Revenue, opts []EventOption) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.closed {
@@ -227,6 +240,13 @@ func (c *Client) enqueue(eventType eventType, eventName string, properties Props
 	}
 
 	session := c.sessions.next()
+	serialized, err := c.mergeProperties(properties)
+	if err != nil {
+		// Rejected locally before the event exists on the wire; surfaced via
+		// warn log and the Rejected counter.
+		c.batch.reject(eventName, err)
+		return
+	}
 	event := Event{
 		EventID:     prefixEvent + generateID(),
 		Event:       eventName,
@@ -235,7 +255,7 @@ func (c *Client) enqueue(eventType eventType, eventName string, properties Props
 		AnonymousID: session.AnonymousID,
 		SessionID:   session.ID,
 		Timestamp:   nowMillis(),
-		Properties:  c.mergeProperties(properties),
+		Properties:  serialized,
 		Revenue:     revenue,
 		Context:     collectContext(),
 	}
@@ -245,10 +265,17 @@ func (c *Client) enqueue(eventType eventType, eventName string, properties Props
 		// own event carries it too.
 		event.UserID = session.UserID
 	}
-	c.batch.enqueue(event)
+	if err := validateEvent(event); err != nil {
+		// Rejected locally: never queued, never sent. The server refuses an
+		// entire batch over one invalid event, so sending would poison every
+		// other event in it.
+		c.batch.reject(eventName, err)
+		return
+	}
+	c.batch.enqueue(event, ctx) // batcher treats a nil ctx as background
 }
 
-func (c *Client) mergeProperties(callProps Props) map[string]string {
+func (c *Client) mergeProperties(callProps Props) (map[string]string, error) {
 	merged := make(Props, len(c.globals)+len(callProps))
 	c.globalsMu.RLock()
 	for key, value := range c.globals {

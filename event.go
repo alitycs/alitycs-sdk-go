@@ -143,6 +143,11 @@ func validateRevenue(r Revenue) (Revenue, error) {
 		if err := validateDecimal("amount", r.Amount); err != nil {
 			return Revenue{}, err
 		}
+		// Per-kind exclusivity mirrors the server: a transaction fact must not
+		// carry recurring-revenue or baseline fields.
+		if r.SubscriptionID != "" || r.MRRAmount != "" || r.ExpectedActiveSubscriptions != nil {
+			return Revenue{}, errors.New("alitycs: transaction revenue contains recurring-only fields (subscriptionId, mrrAmount, expectedActiveSubscriptions)")
+		}
 	case KindMRRSnapshot:
 		if strings.TrimSpace(r.SubscriptionID) == "" {
 			return Revenue{}, errors.New("alitycs: mrr_snapshot requires subscriptionId")
@@ -156,12 +161,18 @@ func validateRevenue(r Revenue) (Revenue, error) {
 		if strings.HasPrefix(r.MRRAmount, "-") {
 			return Revenue{}, errors.New("alitycs: mrr_snapshot amount must be non-negative")
 		}
+		if r.Amount != "" || r.ExpectedActiveSubscriptions != nil {
+			return Revenue{}, errors.New("alitycs: mrr_snapshot revenue contains fields for another revenue kind (amount, expectedActiveSubscriptions)")
+		}
 	case KindMRRBaselineComplete:
 		if r.ExpectedActiveSubscriptions == nil {
 			return Revenue{}, errors.New("alitycs: mrr_baseline_complete requires expectedActiveSubscriptions")
 		}
 		if *r.ExpectedActiveSubscriptions < 0 {
 			return Revenue{}, errors.New("alitycs: expectedActiveSubscriptions must be non-negative")
+		}
+		if r.Amount != "" || r.MRRAmount != "" || r.SubscriptionID != "" || r.CustomerID != "" {
+			return Revenue{}, errors.New("alitycs: mrr_baseline_complete revenue contains fields for another revenue kind (amount, mrrAmount, subscriptionId, customerId)")
 		}
 	default:
 		return Revenue{}, fmt.Errorf("alitycs: unknown revenue kind %q", r.Kind)

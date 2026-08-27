@@ -584,12 +584,14 @@ func TestConcurrentUseIsRaceFree(t *testing.T) {
 func TestQueueOverflowInvariants(t *testing.T) {
 	client, _ := newTestClient(t,
 		WithMaxQueueSize(4),
-		WithFlushSize(1000),
+		// New rejects a flush size above the queue limit — the size
+		// trigger could never fire — so the largest legal value is used;
+		// the timer stays off and overflow behaviour is unchanged.
+		WithFlushSize(4),
 	)
 
-	// No trigger can fire (size too large, timer off), so most of these stay
-	// queued; the exact split between queued and dropped depends on how fast
-	// the loop drains, but conservation must hold.
+	// The exact split between sent, still-queued and dropped depends on how
+	// fast the loop drains against the tiny queue, but conservation must hold.
 	const total = 30
 	for i := 0; i < total; i++ {
 		client.Track(context.Background(), "overflow", Props{"i": i})
@@ -640,4 +642,201 @@ func waitForRequests(t *testing.T, capture *captureServer, n int) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d requests; have %d", n, capture.count())
+}
+
+// TestTrackRejectsOversizedPropertyLocally pins local limit enforcement: an
+// event violating an ingestion limit is never queued or sent, is counted in
+// Stats().Rejected, and surfaces through Shutdown's LostEventsError.
+func TestTrackRejectsOversizedPropertyLocally(t *testing.T) {
+	client, capture := newTestClient(t)
+
+	client.Track(context.Background(), "too_big", Props{"payload": strings.Repeat("v", 1001)})
+	if got := capture.count(); got != 0 {
+		t.Fatalf("rejected event produced %d requests, want 0", got)
+	}
+	if stats := client.Stats(); stats.Rejected != 1 {
+		t.Fatalf("Stats() = %+v, want Rejected=1", stats)
+	}
+
+	// A healthy event after a rejected one still flows normally.
+	client.Track(context.Background(), "healthy", Props{"n": "1"})
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := capture.count(); got != 1 {
+		t.Fatalf("healthy event produced %d requests, want 1", got)
+	}
+	if request := capture.request(0); len(request.payload.Events) != 1 || request.payload.Events[0].Event != "healthy" {
+		t.Fatalf("batch = %+v, want only the healthy event", request.payload.Events)
+	}
+
+	err := client.Shutdown(context.Background())
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Rejected != 1 {
+		t.Fatalf("Shutdown = %v, want LostEventsError with Rejected=1", err)
+	}
+}
+
+// TestNewRejectsFlushSizeAboveQueueSize pins the cross-check: a flush size
+// above the queue limit could never reach the size trigger, so New refuses
+// the combination instead of silently degrading to timer-only flushing.
+func TestNewRejectsFlushSizeAboveQueueSize(t *testing.T) {
+	_, err := New("pk_test", WithFlushSize(50), WithMaxQueueSize(10))
+	if err == nil || !strings.Contains(err.Error(), "exceeds max queue size") {
+		t.Fatalf("New() error = %v, want flush-size-above-queue-limit rejection", err)
+	}
+	// Equal values are the legal boundary.
+	if _, err := New("pk_test", WithFlushSize(10), WithMaxQueueSize(10)); err != nil {
+		t.Fatalf("New() with equal sizes = %v, want nil", err)
+	}
+}
+
+// timeoutRoundTripper is an opaque RoundTripper: its deadlines cannot be
+// inspected, so WithHTTPClient must accept it as-is.
+type timeoutRoundTripper struct{}
+
+func (timeoutRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
+
+// TestWithHTTPClientRequiresADeadlineSomewhere pins the timeout guard: a
+// client with no deadline anywhere would let one wedged connection block the
+// batching goroutine forever, so it is rejected at configuration time.
+func TestWithHTTPClientRequiresADeadlineSomewhere(t *testing.T) {
+	cases := []struct {
+		name    string
+		client  *http.Client
+		allowed bool
+	}{
+		{"no deadline anywhere", &http.Client{}, false},
+		{"default transport sets no deadline", &http.Client{Transport: http.DefaultTransport}, false},
+		{"client timeout", &http.Client{Timeout: time.Second}, true},
+		{"transport response header timeout", &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: time.Second}}, true},
+		{"opaque round tripper accepted", &http.Client{Transport: timeoutRoundTripper{}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New("pk_test", WithHTTPClient(tc.client))
+			if tc.allowed && err != nil {
+				t.Fatalf("New() = %v, want accepted", err)
+			}
+			if !tc.allowed && (err == nil || !strings.Contains(err.Error(), "no timeout")) {
+				t.Fatalf("New() = %v, want no-timeout rejection", err)
+			}
+		})
+	}
+}
+
+// ctxCaptureSend wraps a send to record the context each dispatch ran under.
+func ctxCaptureSend(inner func(ctx context.Context, payload *BatchPayload) error) (
+	func(ctx context.Context, payload *BatchPayload) error,
+	func() context.Context,
+) {
+	var mu sync.Mutex
+	var captured context.Context
+	send := func(ctx context.Context, payload *BatchPayload) error {
+		mu.Lock()
+		captured = ctx
+		mu.Unlock()
+		if inner != nil {
+			return inner(ctx, payload)
+		}
+		return nil
+	}
+	return send, func() context.Context {
+		mu.Lock()
+		defer mu.Unlock()
+		return captured
+	}
+}
+
+// waitForCtx polls until a dispatch has been captured.
+func waitForCtx(t *testing.T, get func() context.Context) context.Context {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx := get(); ctx != nil {
+			return ctx
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for a size-triggered send")
+	return nil
+}
+
+// TestSizeTriggeredSendHonoursEnqueueContext pins ctx propagation: the batch
+// dispatched by the call that completes it runs under that call's context, so
+// cancelling the caller aborts the dispatch instead of ignoring it.
+func TestSizeTriggeredSendHonoursEnqueueContext(t *testing.T) {
+	client, _ := newTestClient(t, WithFlushSize(2))
+	send, lastCtx := ctxCaptureSend(nil)
+	client.batch.send = send // safe: the loop reads b.send only after receiving an event
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the call, so the send sees it deterministically
+	client.Track(context.Background(), "first", Props{"n": "1"})
+	client.Track(ctx, "second", Props{"n": "2"}) // completes the batch
+
+	if got := waitForCtx(t, lastCtx); !errors.Is(got.Err(), context.Canceled) {
+		t.Fatalf("size-triggered send ran with %v, want the cancelling call's context", got)
+	}
+
+	// A background-enqueued trigger still runs on a live context.
+	client.Track(context.Background(), "third", Props{"n": "3"})
+	client.Track(context.Background(), "fourth", Props{"n": "4"})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := lastCtx(); got != nil && client.batch.delivered.Load() >= 4 {
+			if got.Err() != nil {
+				t.Fatalf("background-triggered send ran with %v, want a live context", got)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("background-triggered send never ran")
+}
+
+// TestFlushContextAbortsDrainSend pins Flush's ctx reaching the network: a
+// cancellation while the drain's request is in flight fails that batch rather
+// than waiting it out, and the error surfaces from Flush.
+func TestFlushContextAbortsDrainSend(t *testing.T) {
+	client, capture := newTestClient(t)
+	capture.block()
+	t.Cleanup(capture.unblock) // never leave a parked handler blocking Server.Close
+
+	client.Track(context.Background(), "stalled", Props{"n": "1"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Flush(ctx) }()
+	waitForRequests(t, capture, 1) // request is parked inside the blocked handler
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Flush after cancel = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Flush ignored ctx cancellation during its send")
+	}
+
+	// Flush may return through its own ctx.Done branch a beat before the
+	// loop goroutine has accounted the aborted batch.
+	deadline := time.Now().Add(5 * time.Second)
+	for client.Stats().Failed != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Stats().Failed = %d, want 1 aborted batch", client.Stats().Failed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	capture.unblock()
+	// The aborted batch was lost, not requeued; the client must keep working.
+	client.Track(context.Background(), "after_abort", Props{"n": "2"})
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush after abort: %v", err)
+	}
+	waitForRequests(t, capture, 2)
 }

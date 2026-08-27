@@ -2,6 +2,7 @@ package alitycs
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -121,13 +122,36 @@ func WithSessionTimeout(d time.Duration) Option {
 // WithHTTPClient injects a custom *http.Client, for proxies, transports or
 // timeouts; it is used exactly as provided. The default client has a 10s
 // timeout.
+//
+// A client with no deadline anywhere lets one wedged connection block the
+// single batching goroutine forever, so New rejects a client whose Timeout is
+// zero unless its transport sets its own ResponseHeaderTimeout. Opaque
+// RoundTripper implementations are accepted as-is — their deadlines cannot be
+// inspected.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *config) error {
 		if hc == nil {
 			return errors.New("alitycs: http client must not be nil")
 		}
+		if hc.Timeout <= 0 && !transportHasHeaderDeadline(hc.Transport) {
+			return errors.New("alitycs: http client has no timeout — set Client.Timeout or Transport.ResponseHeaderTimeout so a stalled connection cannot wedge batching")
+		}
 		c.httpClient = hc
 		return nil
+	}
+}
+
+// transportHasHeaderDeadline reports whether the transport bounds how long a
+// response may take. Only *http.Transport can be inspected; any other
+// RoundTripper is assumed to manage its own deadlines.
+func transportHasHeaderDeadline(t http.RoundTripper) bool {
+	switch tr := t.(type) {
+	case nil:
+		return false // http.DefaultTransport sets no ResponseHeaderTimeout either
+	case *http.Transport:
+		return tr.ResponseHeaderTimeout > 0
+	default:
+		return true
 	}
 }
 
@@ -153,6 +177,10 @@ func newConfig(apiKey string, opts ...Option) (*config, error) {
 		if err := opt(cfg); err != nil {
 			return nil, err
 		}
+	}
+	if cfg.flushSize > cfg.maxQueueSize {
+		return nil, fmt.Errorf("alitycs: flush size (%d) exceeds max queue size (%d) — the queue would fill first and the size trigger could never fire",
+			cfg.flushSize, cfg.maxQueueSize)
 	}
 	return cfg, nil
 }
