@@ -211,10 +211,16 @@ func (b *batcher) waitDone(ctx context.Context) error {
 		}
 		return nil
 	case <-ctx.Done():
-		return &UndeliveredError{
+		undelivered := &UndeliveredError{
 			Undelivered: b.undeliveredAtDeadline(),
 			Cause:       ctx.Err(),
 		}
+		failed := b.failed.Load()
+		rejected := b.rejected.Load()
+		if failed > 0 || rejected > 0 {
+			return errors.Join(undelivered, &LostEventsError{Lost: failed, Rejected: rejected})
+		}
+		return undelivered
 	}
 }
 
@@ -397,13 +403,23 @@ func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocke
 	b.lastCause = err
 	var outcome *recoveryOutcomeError
 	if errors.As(err, &outcome) {
-		b.failed.Add(outcome.Lost)
-		b.recoveryFailed.Add(outcome.Lost)
+		if !outcome.reported {
+			b.failed.Add(outcome.Lost)
+			b.recoveryFailed.Add(outcome.Lost)
+		}
 		if !outcome.Blocked {
 			return err, nil
 		}
 	}
 	return nil, err
+}
+
+func (b *batcher) recordRecoveryProgress(lost int64) {
+	if lost > 0 {
+		b.failed.Add(lost)
+		b.recoveryFailed.Add(lost)
+	}
+	b.updateRecoveryOwned()
 }
 
 func (b *batcher) updateRecoveryOwned() {

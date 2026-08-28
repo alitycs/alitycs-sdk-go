@@ -575,3 +575,74 @@ func TestShutdownDeadlineIncludesRecoveredWALRecords(t *testing.T) {
 		t.Fatalf("completed Shutdown: %v", err)
 	}
 }
+
+func TestShutdownDeadlineReportsRecoveredLossBeforeBlockedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, batchID := range []string{"batch_rejected", "batch_blocked"} {
+		payload := samplePayload()
+		payload.BatchID = batchID
+		record, err := durableRecord(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.put(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var attempts atomic.Int32
+	blocked := make(chan struct{})
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		close(blocked)
+		<-unblock
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(unblock)
+		}
+	}()
+	client, err := New(
+		"pk_test",
+		WithEndpoint(server.URL),
+		WithFlushInterval(0),
+		WithMaxRetries(0),
+		WithPersistence(path),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	shutdownErr := client.Shutdown(ctx)
+	select {
+	case <-blocked:
+	default:
+		t.Fatal("shutdown deadline elapsed before recovery reached the blocked record")
+	}
+	var undelivered *UndeliveredError
+	if !errors.As(shutdownErr, &undelivered) || undelivered.Undelivered != 1 {
+		t.Fatalf("Shutdown = %v, want UndeliveredError with one retained event", shutdownErr)
+	}
+	var lost *LostEventsError
+	if !errors.As(shutdownErr, &lost) || lost.Lost != 1 {
+		t.Fatalf("Shutdown = %v, want LostEventsError with one recovered loss", shutdownErr)
+	}
+	close(unblock)
+	released = true
+	finalErr := client.Shutdown(context.Background())
+	if !errors.As(finalErr, &lost) || lost.Lost != 1 {
+		t.Fatalf("completed Shutdown = %v, want the same single recovered loss", finalErr)
+	}
+}

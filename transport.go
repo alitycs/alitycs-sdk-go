@@ -26,6 +26,11 @@ type transport struct {
 	debug      bool
 	store      *fileBatchStore
 
+	// onRecoveryProgress reports each WAL record resolved during recovery.
+	// The batcher uses it to keep shutdown counts honest while a later record
+	// may still be blocked in the same recovery pass.
+	onRecoveryProgress func(lost int64)
+
 	// backoff overrides the retry schedule; tests use it to avoid real
 	// sleeps. nil means the production schedule.
 	backoff func(attempt int) time.Duration
@@ -101,9 +106,10 @@ func (e *recoveryDeferredError) Error() string {
 // recoveryOutcomeError reports persisted events that were permanently
 // rejected while distinguishing whether another record still blocks recovery.
 type recoveryOutcomeError struct {
-	Lost    int64
-	Blocked bool
-	Cause   error
+	Lost     int64
+	Blocked  bool
+	Cause    error
+	reported bool
 }
 
 func (e *recoveryOutcomeError) Error() string {
@@ -116,9 +122,11 @@ func (e *recoveryOutcomeError) Error() string {
 
 func (e *recoveryOutcomeError) Unwrap() error { return e.Cause }
 
-func recoveryResult(lost int64, blocked bool, cause error) error {
+func (t *transport) recoveryResult(lost int64, blocked bool, cause error) error {
 	if lost > 0 {
-		return &recoveryOutcomeError{Lost: lost, Blocked: blocked, Cause: cause}
+		return &recoveryOutcomeError{
+			Lost: lost, Blocked: blocked, Cause: cause, reported: t.onRecoveryProgress != nil,
+		}
 	}
 	return cause
 }
@@ -128,7 +136,7 @@ func (t *transport) recover(ctx context.Context) error {
 	var lastTerminal error
 	for _, record := range t.store.snapshot() {
 		if err := ctx.Err(); err != nil {
-			return recoveryResult(lost, true, err)
+			return t.recoveryResult(lost, true, err)
 		}
 		now := time.Now()
 		deadline := time.UnixMilli(record.PausedUntilMS)
@@ -136,7 +144,7 @@ func (t *transport) recover(ctx context.Context) error {
 		if record.PausedUntilMS > 0 && deadline.After(maximumDeadline) {
 			record.PausedUntilMS = maximumDeadline.UnixMilli()
 			if err := t.store.pause(record.BatchID, record.PausedUntilMS); err != nil {
-				return recoveryResult(lost, true, err)
+				return t.recoveryResult(lost, true, err)
 			}
 			deadline = time.UnixMilli(record.PausedUntilMS)
 		}
@@ -144,7 +152,7 @@ func (t *transport) recover(ctx context.Context) error {
 			// Recovery runs on the single batcher loop. Defer a paused record
 			// instead of sleeping here so the loop can continue draining events;
 			// returning an error also keeps newer batches from overtaking the WAL.
-			return recoveryResult(lost, true, &recoveryDeferredError{untilMS: record.PausedUntilMS})
+			return t.recoveryResult(lost, true, &recoveryDeferredError{untilMS: record.PausedUntilMS})
 		}
 		if err := t.sendRecord(ctx, record); err != nil {
 			var terminal *terminalStatusError
@@ -153,12 +161,18 @@ func (t *transport) recover(ctx context.Context) error {
 				lastTerminal = err
 				warnLog("recovered batch %s rejected permanently (HTTP %d) — discarding %d persisted events",
 					record.BatchID, terminal.status, record.EventCount)
+				if t.onRecoveryProgress != nil {
+					t.onRecoveryProgress(int64(record.EventCount))
+				}
 				continue
 			}
-			return recoveryResult(lost, true, err)
+			return t.recoveryResult(lost, true, err)
+		}
+		if t.onRecoveryProgress != nil {
+			t.onRecoveryProgress(0)
 		}
 	}
-	return recoveryResult(lost, false, lastTerminal)
+	return t.recoveryResult(lost, false, lastTerminal)
 }
 
 func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) error {

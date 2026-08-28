@@ -67,6 +67,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		globals:     make(Props),
 	}
 	c.batch = newBatcher(cfg, t.send, t.persist, t.recover, store.pendingEvents, store.enabled())
+	t.onRecoveryProgress = c.batch.recordRecoveryProgress
 	c.batch.start()
 	return c, nil
 }
