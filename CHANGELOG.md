@@ -47,8 +47,9 @@ here before a version tag is created.
   an unbounded request storm. Concurrent admission now reserves queue capacity atomically and
   includes retained durable events in the budget.
 - Terminal rejections of persisted single events now count in `Stats().Failed` and
-  `LostEventsError` after their WAL records are removed; shutdown reports any accepted events that
-  cannot be appended to the WAL after a recovery failure. When retained and permanently lost
+  `LostEventsError` after their WAL records are removed, including rejections observed only during
+  restart recovery; `Flush` also reports that recovery loss. Shutdown reports any accepted events
+  that cannot be appended to the WAL after a recovery failure. When retained and permanently lost
   events coexist, the returned error exposes both `UndeliveredError` and `LostEventsError`.
 
 [Unreleased]: https://github.com/alitycs/alitycs-sdk-go/compare/v1.0.0...HEAD

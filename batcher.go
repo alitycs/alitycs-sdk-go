@@ -263,8 +263,7 @@ func (b *batcher) loop() {
 				// events stream in; anything extra waits its turn. The
 				// send answers to the call that completed the batch —
 				// its ctx can cancel or deadline the dispatch.
-				if err := b.recover(in.ctx); err != nil {
-					b.lastCause = err
+				if _, blocked := b.recoverBeforeSend(in.ctx); blocked != nil {
 					break
 				}
 				chunk := b.pending[:b.flushSize]
@@ -285,9 +284,8 @@ func (b *batcher) loop() {
 // finish drains everything still queued after stop and sends it in batches of
 // flushSize. Losses are counted by sendChunk and reported through waitDone.
 func (b *batcher) finish(ctx context.Context) {
-	if err := b.recover(ctx); err != nil {
-		b.lastCause = err
-		debugLog(b.debug, "durable recovery failed during shutdown — preserving newly queued events: %v", err)
+	if _, blocked := b.recoverBeforeSend(ctx); blocked != nil {
+		debugLog(b.debug, "durable recovery failed during shutdown — preserving newly queued events: %v", blocked)
 		b.persistPending()
 		return
 	}
@@ -359,12 +357,11 @@ func (b *batcher) drainChannel() {
 // empty queue sends nothing; flushes never fabricate empty requests. The
 // first terminal failure is returned after every chunk has had its turn.
 func (b *batcher) sendPending(ctx context.Context) error {
-	if err := b.recover(ctx); err != nil {
-		b.lastCause = err
-		return err
+	firstErr, blocked := b.recoverBeforeSend(ctx)
+	if blocked != nil {
+		return blocked
 	}
 	b.drainChannel()
-	var firstErr error
 	for len(b.pending) > 0 {
 		size := b.flushSize
 		if size > len(b.pending) {
@@ -377,6 +374,25 @@ func (b *batcher) sendPending(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// recoverBeforeSend records permanently rejected recovered events exactly once.
+// A terminal-only recovery outcome is reportable but does not block newer work;
+// deferred or transient recovery errors preserve WAL-first delivery ordering.
+func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocked error) {
+	err := b.recover(ctx)
+	if err == nil {
+		return nil, nil
+	}
+	b.lastCause = err
+	var outcome *recoveryOutcomeError
+	if errors.As(err, &outcome) {
+		b.failed.Add(outcome.Lost)
+		if !outcome.Blocked {
+			return err, nil
+		}
+	}
+	return nil, err
 }
 
 // maxSplitSends bounds whole-batch rejection isolation so one response cannot

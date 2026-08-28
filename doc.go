@@ -56,8 +56,9 @@
 // serialized body is atomically stored immediately before its first network
 // attempt; an exhausted transient failure remains for the next process to
 // replay during Flush or Shutdown, including any remaining Retry-After pause.
-// Terminal responses acknowledge and remove it. If older WAL recovery is
-// blocked during Shutdown, accepted pre-flush events are appended in FIFO order.
+// Terminal responses acknowledge and remove it; recovered terminal rejections
+// count in Stats().Failed and Shutdown's LostEventsError. If older WAL recovery
+// is blocked during Shutdown, accepted pre-flush events are appended in FIFO order.
 // The WAL is capped at maxQueueSize retained events, and one client process must
 // own a given path. SDK-generated exponential backoff is capped at 10 seconds;
 // an explicit server Retry-After is capped at one minute and paused recovery is

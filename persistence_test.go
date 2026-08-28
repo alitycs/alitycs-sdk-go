@@ -276,10 +276,10 @@ func TestFileBatchStoreSyncsNewDirectoryParents(t *testing.T) {
 
 func TestTransportRecoversExactPersistedBody(t *testing.T) {
 	var attempts atomic.Int32
-	var bodies [][]byte
+	bodies := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, body)
+		bodies <- string(body)
 		if attempts.Add(1) == 1 {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -304,8 +304,9 @@ func TestTransportRecoversExactPersistedBody(t *testing.T) {
 	if err := restarted.recover(context.Background()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	if string(bodies[0]) != string(bodies[1]) {
-		t.Fatalf("replay changed body:\n%s\n%s", bodies[0], bodies[1])
+	firstBody, replayedBody := <-bodies, <-bodies
+	if firstBody != replayedBody {
+		t.Fatalf("replay changed body:\n%s\n%s", firstBody, replayedBody)
 	}
 	if restartedStore.pendingEvents() != 0 {
 		t.Fatalf("pending = %d, want 0", restartedStore.pendingEvents())
@@ -468,5 +469,52 @@ func TestPersistentTerminalRejectionCountsAsFailedAndLeavesNoWALRecord(t *testin
 	}
 	if got := restarted.pendingEvents(); got != 0 {
 		t.Fatalf("pending WAL events = %d, want terminal rejection removed", got)
+	}
+}
+
+func TestRecoveredTerminalRejectionCountsAsFailedAndLeavesNoWALRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := durableRecord(samplePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+	client, err := New(
+		"pk_test",
+		WithEndpoint(server.URL),
+		WithFlushSize(100),
+		WithFlushInterval(0),
+		WithMaxRetries(0),
+		WithPersistence(path),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flushErr := client.Flush(context.Background())
+	var outcome *recoveryOutcomeError
+	if !errors.As(flushErr, &outcome) || outcome.Lost != 1 || outcome.Blocked {
+		t.Fatalf("Flush = %v, want one non-blocking recovered loss", flushErr)
+	}
+	if got := client.Stats().Failed; got != 1 {
+		t.Fatalf("Stats().Failed = %d, want 1", got)
+	}
+	shutdownErr := client.Shutdown(context.Background())
+	var lost *LostEventsError
+	if !errors.As(shutdownErr, &lost) || lost.Lost != 1 {
+		t.Fatalf("Shutdown = %v, want LostEventsError with one recovered loss", shutdownErr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("terminal recovery left WAL behind: %v", err)
 	}
 }
