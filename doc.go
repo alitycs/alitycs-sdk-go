@@ -60,9 +60,9 @@
 // blocked during Shutdown, accepted pre-flush events are appended in FIFO order.
 // The WAL is capped at maxQueueSize retained events, and one client process must
 // own a given path. SDK-generated exponential backoff is capped at 10 seconds;
-// an explicit server Retry-After is capped at one minute so it cannot stall the
-// single batcher indefinitely. HTTP 400 split isolation is bounded to 64 sends
-// per original batch.
+// an explicit server Retry-After is capped at one minute and paused recovery is
+// deferred instead of sleeping on the single batcher goroutine. HTTP 400 split
+// isolation is bounded to 64 sends per original batch.
 //
 // # Contexts
 //

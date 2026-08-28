@@ -92,17 +92,29 @@ type retryAfterError struct {
 func (e *retryAfterError) Error() string { return e.cause.Error() }
 func (e *retryAfterError) Unwrap() error { return e.cause }
 
+type recoveryDeferredError struct{ untilMS int64 }
+
+func (e *recoveryDeferredError) Error() string {
+	return fmt.Sprintf("alitycs: durable recovery deferred until %s", time.UnixMilli(e.untilMS).UTC().Format(time.RFC3339Nano))
+}
+
 func (t *transport) recover(ctx context.Context) error {
 	for _, record := range t.store.snapshot() {
-		if remaining := time.Until(time.UnixMilli(record.PausedUntilMS)); record.PausedUntilMS > 0 && remaining > 0 {
-			remaining = boundedRetryAfter(remaining)
-			sleepFn := t.sleep
-			if sleepFn == nil {
-				sleepFn = sleepContext
-			}
-			if err := sleepFn(ctx, remaining); err != nil {
+		now := time.Now()
+		deadline := time.UnixMilli(record.PausedUntilMS)
+		maximumDeadline := now.Add(maxRetryAfter)
+		if record.PausedUntilMS > 0 && deadline.After(maximumDeadline) {
+			record.PausedUntilMS = maximumDeadline.UnixMilli()
+			if err := t.store.pause(record.BatchID, record.PausedUntilMS); err != nil {
 				return err
 			}
+			deadline = time.UnixMilli(record.PausedUntilMS)
+		}
+		if record.PausedUntilMS > 0 && deadline.After(now) {
+			// Recovery runs on the single batcher loop. Defer a paused record
+			// instead of sleeping here so the loop can continue draining events;
+			// returning an error also keeps newer batches from overtaking the WAL.
+			return &recoveryDeferredError{untilMS: record.PausedUntilMS}
 		}
 		if err := t.sendRecord(ctx, record); err != nil {
 			var terminal *terminalStatusError

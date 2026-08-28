@@ -32,7 +32,8 @@ here before a version tag is created.
 ### Fixed
 - A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
   after it waits that long instead of the default backoff, capped at one minute so a malicious or
-  malformed response cannot stall the single batching goroutine indefinitely.
+  malformed response cannot stall indefinitely. Restart recovery defers a still-paused record
+  without sleeping on the single batching goroutine, while preserving WAL-first delivery order.
   The redelivered batch stays byte-identical — only the timing changes.
 - New now rejects a flush size above the max queue size instead of accepting the configuration:
   with flushSize > maxQueueSize the queue budget filled first, so the size trigger could never

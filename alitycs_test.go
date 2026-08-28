@@ -285,6 +285,7 @@ func TestWithUserIDAppliesToEveryEventAPI(t *testing.T) {
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
+	waitForRequests(t, capture, 1)
 
 	expected := map[string]string{
 		"scoped_track":        "usr_track",

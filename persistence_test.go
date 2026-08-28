@@ -335,21 +335,37 @@ func TestTransportRecoveryHonoursPersistedRetryAfter(t *testing.T) {
 	restartedStore, _ := newFileBatchStore(path, defaultMaxQueueSize)
 	restarted := newTestTransport(t, server.URL, 0)
 	restarted.store = restartedStore
-	var waited time.Duration
-	restarted.sleep = func(_ context.Context, delay time.Duration) error {
-		waited = delay
+	restarted.sleep = func(context.Context, time.Duration) error {
+		t.Fatal("recovery must not sleep on the batcher loop")
 		return nil
 	}
-	if err := restarted.recover(context.Background()); err != nil {
+	err := restarted.recover(context.Background())
+	var deferred *recoveryDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("recover error = %v, want recoveryDeferredError", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("recovery made %d requests before Retry-After elapsed, want 1", got)
+	}
+	snapshot := restartedStore.snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("pending records = %d, want 1", len(snapshot))
+	}
+	if err := restartedStore.pause(snapshot[0].BatchID, time.Now().Add(-time.Second).UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
-	if waited < 2500*time.Millisecond {
-		t.Fatalf("waited %s, want remaining Retry-After", waited)
+	if err := restarted.recover(context.Background()); err != nil {
+		t.Fatalf("recover after Retry-After: %v", err)
+	}
+	if got := attempts.Load(); got != 2 || restartedStore.pendingEvents() != 0 {
+		t.Fatalf("attempts = %d, pending = %d; want 2, 0", got, restartedStore.pendingEvents())
 	}
 }
 
-func TestTransportRecoveryBoundsPersistedRetryAfter(t *testing.T) {
+func TestTransportRecoveryCapsAndDefersUntrustedPersistedRetryAfter(t *testing.T) {
+	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
@@ -374,16 +390,23 @@ func TestTransportRecoveryBoundsPersistedRetryAfter(t *testing.T) {
 	}
 	transport := newTestTransport(t, server.URL, 0)
 	transport.store = restarted
-	var waited time.Duration
-	transport.sleep = func(_ context.Context, delay time.Duration) error {
-		waited = delay
+	transport.sleep = func(context.Context, time.Duration) error {
+		t.Fatal("recovery must not sleep on the batcher loop")
 		return nil
 	}
-	if err := transport.recover(context.Background()); err != nil {
-		t.Fatal(err)
+	before := time.Now()
+	err = transport.recover(context.Background())
+	var deferred *recoveryDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("recover error = %v, want recoveryDeferredError", err)
 	}
-	if waited != maxRetryAfter {
-		t.Fatalf("waited %s, want bounded recovery delay %s", waited, maxRetryAfter)
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("recovery made %d requests before the bounded deadline, want 0", got)
+	}
+	maximum := before.Add(maxRetryAfter + time.Second).UnixMilli()
+	snapshot := restarted.snapshot()
+	if len(snapshot) != 1 || snapshot[0].PausedUntilMS > maximum {
+		t.Fatalf("bounded persisted deadline = %#v, want no later than %d", snapshot, maximum)
 	}
 }
 
