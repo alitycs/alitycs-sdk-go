@@ -276,7 +276,7 @@ func TestTransportHonoursRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
-func TestTransportDoesNotShortenRetryAfterToMaxBackoff(t *testing.T) {
+func TestTransportBoundsServerRetryAfterAboveTheLivenessCeiling(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) == 1 {
@@ -298,8 +298,8 @@ func TestTransportDoesNotShortenRetryAfterToMaxBackoff(t *testing.T) {
 	if err := tr.send(context.Background(), samplePayload()); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if len(waits) != 1 || waits[0] != time.Hour {
-		t.Fatalf("waits = %v, want the full server Retry-After of 1h", waits)
+	if len(waits) != 1 || waits[0] != maxRetryAfter {
+		t.Fatalf("waits = %v, want the bounded server Retry-After of %s", waits, maxRetryAfter)
 	}
 }
 
@@ -388,5 +388,43 @@ func TestParseRetryAfter(t *testing.T) {
 	future := now.Add(90 * time.Second).Format(http.TimeFormat)
 	if got, ok := parseRetryAfter(future, now); !ok || got < 89*time.Second || got > 90*time.Second {
 		t.Errorf("future HTTP-date = %s, want ~90s", got)
+	}
+}
+
+func TestServerRetryAfterIsBoundedDuringSend(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "9223372037")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	transport := newTestTransport(t, server.URL, 1)
+	var waited time.Duration
+	transport.sleep = func(_ context.Context, delay time.Duration) error {
+		waited = delay
+		return nil
+	}
+	if err := transport.send(context.Background(), samplePayload()); err != nil {
+		t.Fatal(err)
+	}
+	if waited != maxRetryAfter {
+		t.Fatalf("waited %s, want bounded Retry-After %s", waited, maxRetryAfter)
+	}
+}
+
+func TestBoundedRetryAfter(t *testing.T) {
+	if got := boundedRetryAfter(-time.Second); got != 0 {
+		t.Fatalf("negative delay bounded to %s, want zero", got)
+	}
+	if got := boundedRetryAfter(30 * time.Second); got != 30*time.Second {
+		t.Fatalf("ordinary delay bounded to %s, want 30s", got)
+	}
+	if got := boundedRetryAfter(time.Hour); got != maxRetryAfter {
+		t.Fatalf("large delay bounded to %s, want %s", got, maxRetryAfter)
 	}
 }

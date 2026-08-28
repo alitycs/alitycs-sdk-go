@@ -124,12 +124,23 @@ unless guard_fails &&
   failures << "release must require annotated tags"
 end
 tag_identity_rechecked = lambda do |lines|
-  lines.include?(
+  fetch_index = lines.index('git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"')
+  object_index = lines.index(
     '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
-  ) && lines.include?(
+  )
+  commit_index = lines.index(
     '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
-  ) && lines.include?('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
+  )
+  sha_index = lines.index('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
+  fetch_index && object_index && commit_index && sha_index &&
+    fetch_index < object_index && object_index < commit_index && commit_index < sha_index
 end
+identity_checks_without_fetch = [
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
+  '[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]',
+]
+failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
 unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
 end

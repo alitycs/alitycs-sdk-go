@@ -2,12 +2,14 @@ package alitycs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,7 +21,9 @@ func TestFileBatchStoreLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := durableBatchRecord{BatchID: "batch_exact", Body: `{"batchId":"batch_exact"}`, EventCount: 2}
+	record := durableBatchRecord{
+		BatchID: "batch_exact", Body: `{"batchId":"batch_exact","events":[{},{}]}`, EventCount: 2,
+	}
 	if err := store.put(record); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +33,9 @@ func TestFileBatchStoreLifecycle(t *testing.T) {
 	if err := store.pause(record.BatchID, 123456); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.put(durableBatchRecord{BatchID: "batch_second", Body: "{}", EventCount: 1}); err != nil {
+	if err := store.put(durableBatchRecord{
+		BatchID: "batch_second", Body: `{"batchId":"batch_second","events":[{}]}`, EventCount: 1,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,6 +58,51 @@ func TestFileBatchStoreLifecycle(t *testing.T) {
 	}
 }
 
+func TestFileBatchStoreRejectsInvalidSerializedBodies(t *testing.T) {
+	tests := []struct {
+		name   string
+		record durableBatchRecord
+	}{
+		{name: "missing metadata", record: durableBatchRecord{}},
+		{name: "invalid json", record: durableBatchRecord{BatchID: "batch", Body: "not-json", EventCount: 1}},
+		{name: "mismatched batch id", record: durableBatchRecord{
+			BatchID: "batch", Body: `{"batchId":"other","events":[{}]}`, EventCount: 1,
+		}},
+		{name: "mismatched event count", record: durableBatchRecord{
+			BatchID: "batch", Body: `{"batchId":"batch","events":[{}]}`, EventCount: 2,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "wal.json")
+			raw, err := json.Marshal(durableBatchState{Version: 1, Batches: []durableBatchRecord{test.record}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := newFileBatchStore(path, defaultMaxQueueSize); err == nil {
+				t.Fatal("invalid serialized body must fail initialization")
+			}
+		})
+	}
+}
+
+func TestSyncDirectoryReportsSupportedOpenFailure(t *testing.T) {
+	err := syncDirectory(filepath.Join(t.TempDir(), "missing"))
+	switch runtime.GOOS {
+	case "darwin", "ios", "windows", "plan9", "js", "wasip1":
+		if err != nil {
+			t.Fatalf("unsupported directory sync returned %v", err)
+		}
+	default:
+		if err == nil {
+			t.Fatal("supported directory sync hid an open failure")
+		}
+	}
+}
+
 func TestFileBatchStoreRejectsCorruptState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal.json")
 	if err := os.WriteFile(path, []byte("not-json"), 0o600); err != nil {
@@ -68,7 +119,9 @@ func TestFileBatchStoreBoundsPendingEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.put(durableBatchRecord{BatchID: "batch_full", Body: "{}", EventCount: 2}); err != nil {
+	if err := store.put(durableBatchRecord{
+		BatchID: "batch_full", Body: `{"batchId":"batch_full","events":[{},{}]}`, EventCount: 2,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.put(durableBatchRecord{BatchID: "batch_overflow", Body: "{}", EventCount: 1}); err == nil {
@@ -88,7 +141,9 @@ func TestFileBatchStoreRollsBackMemoryAfterWriteFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := durableBatchRecord{BatchID: "batch_exact", Body: "{}", EventCount: 1}
+	record := durableBatchRecord{
+		BatchID: "batch_exact", Body: `{"batchId":"batch_exact","events":[{}]}`, EventCount: 1,
+	}
 	if err := store.put(record); err != nil {
 		t.Fatal(err)
 	}
@@ -182,6 +237,45 @@ func TestTransportRecoveryHonoursPersistedRetryAfter(t *testing.T) {
 	}
 	if waited < 2500*time.Millisecond {
 		t.Fatalf("waited %s, want remaining Retry-After", waited)
+	}
+}
+
+func TestTransportRecoveryBoundsPersistedRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := durableRecord(samplePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.PausedUntilMS = time.Now().Add(24 * time.Hour).UnixMilli()
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := newTestTransport(t, server.URL, 0)
+	transport.store = restarted
+	var waited time.Duration
+	transport.sleep = func(_ context.Context, delay time.Duration) error {
+		waited = delay
+		return nil
+	}
+	if err := transport.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if waited != maxRetryAfter {
+		t.Fatalf("waited %s, want bounded recovery delay %s", waited, maxRetryAfter)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 )
 
 const maxBackoff = 10 * time.Second
+const maxRetryAfter = time.Minute
 
 // transport POSTs batch payloads to the ingest endpoint with retry.
 type transport struct {
@@ -94,6 +95,7 @@ func (e *retryAfterError) Unwrap() error { return e.cause }
 func (t *transport) recover(ctx context.Context) error {
 	for _, record := range t.store.snapshot() {
 		if remaining := time.Until(time.UnixMilli(record.PausedUntilMS)); record.PausedUntilMS > 0 && remaining > 0 {
+			remaining = boundedRetryAfter(remaining)
 			sleepFn := t.sleep
 			if sleepFn == nil {
 				sleepFn = sleepContext
@@ -143,7 +145,7 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 			return nil
 		}
 		lastErr = err
-		retryAfter, hasRetryAfter = suggested, suggestedOK
+		retryAfter, hasRetryAfter = boundedRetryAfter(suggested), suggestedOK
 		if errors.Is(err, errTerminalStatus) {
 			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
 				return storeErr
@@ -162,6 +164,16 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 		return err
 	}
 	return &retryAfterError{cause: wrapped, untilMS: untilMS}
+}
+
+func boundedRetryAfter(delay time.Duration) time.Duration {
+	if delay < 0 {
+		return 0
+	}
+	if delay > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return delay
 }
 
 var errTerminalStatus = errors.New("terminal status")

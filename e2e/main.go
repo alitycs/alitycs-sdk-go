@@ -26,6 +26,9 @@ func run() error {
 	runID := requiredEnvironment("ALITYCS_RUN_ID")
 	phase := os.Getenv("ALITYCS_E2E_PHASE")
 	stateFile := os.Getenv("ALITYCS_STATE_FILE")
+	if err := validateRestartState(phase, stateFile); err != nil {
+		return err
+	}
 	if phase == "first" {
 		endpoint = requiredEnvironment("ALITYCS_FAILURE_ENDPOINT")
 	}
@@ -53,8 +56,17 @@ func run() error {
 			"scenario":    "go-restart",
 		})
 		client.Track(ctx, "sdk_go_restart_"+runID, nil)
-		_ = client.Flush(ctx)
-		os.Exit(0)
+		if err := client.Flush(ctx); err == nil {
+			return fmt.Errorf("first-phase failure endpoint unexpectedly accepted the event")
+		}
+		info, err := os.Stat(stateFile)
+		if err != nil {
+			return fmt.Errorf("first-phase WAL was not created: %w", err)
+		}
+		if info.Size() == 0 {
+			return fmt.Errorf("first-phase WAL is empty")
+		}
+		return nil
 	}
 	if phase == "restart" {
 		if err := client.Flush(ctx); err != nil {
@@ -91,4 +103,11 @@ func requiredEnvironment(name string) string {
 		os.Exit(1)
 	}
 	return value
+}
+
+func validateRestartState(phase, stateFile string) error {
+	if (phase == "first" || phase == "restart") && stateFile == "" {
+		return fmt.Errorf("ALITYCS_STATE_FILE is required for %s phase", phase)
+	}
+	return nil
 }

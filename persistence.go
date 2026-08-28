@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -54,7 +55,7 @@ func newFileBatchStore(path string, maxPendingEvents int) (*fileBatchStore, erro
 		return nil, fmt.Errorf("alitycs: invalid persistence file %q", path)
 	}
 	for _, record := range state.Batches {
-		if record.BatchID == "" || record.EventCount < 1 {
+		if err := validateDurableRecord(record); err != nil {
 			return nil, fmt.Errorf("alitycs: invalid persistence record in %q", path)
 		}
 		if _, exists := store.records[record.BatchID]; exists {
@@ -68,6 +69,23 @@ func newFileBatchStore(path string, maxPendingEvents int) (*fileBatchStore, erro
 		}
 	}
 	return store, nil
+}
+
+func validateDurableRecord(record durableBatchRecord) error {
+	if record.BatchID == "" || record.EventCount < 1 || record.Body == "" {
+		return errors.New("alitycs: invalid persistence record metadata")
+	}
+	var envelope struct {
+		BatchID string            `json:"batchId"`
+		Events  []json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(record.Body), &envelope); err != nil {
+		return fmt.Errorf("alitycs: invalid persisted batch body: %w", err)
+	}
+	if envelope.BatchID != record.BatchID || len(envelope.Events) != record.EventCount {
+		return errors.New("alitycs: persisted batch body does not match its record")
+	}
+	return nil
 }
 
 func (s *fileBatchStore) enabled() bool { return s != nil && s.path != "" }
@@ -179,7 +197,9 @@ func (s *fileBatchStore) writeLocked() error {
 		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("alitycs: remove empty persistence file: %w", err)
 		}
-		syncDirectoryBestEffort(filepath.Dir(s.path))
+		if err := syncDirectory(filepath.Dir(s.path)); err != nil {
+			return err
+		}
 		return nil
 	}
 	directory := filepath.Dir(s.path)
@@ -201,7 +221,7 @@ func (s *fileBatchStore) writeLocked() error {
 		return fmt.Errorf("alitycs: create persistence temp file: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() { _ = os.Remove(temporaryPath) }()
 	if _, err = temporary.Write(raw); err == nil {
 		err = temporary.Sync()
 	}
@@ -215,15 +235,31 @@ func (s *fileBatchStore) writeLocked() error {
 	if err := os.Rename(temporaryPath, s.path); err != nil {
 		return fmt.Errorf("alitycs: replace persistence state: %w", err)
 	}
-	syncDirectoryBestEffort(directory)
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
 	return nil
 }
 
-func syncDirectoryBestEffort(directory string) {
+func syncDirectory(directory string) error {
+	// Directory fsync is unavailable on these targets. Atomic rename/remove still
+	// applies, but the platform cannot provide the stronger power-loss durability
+	// guarantee available on Unix filesystems that support syncing directories.
+	switch runtime.GOOS {
+	case "darwin", "ios", "windows", "plan9", "js", "wasip1":
+		return nil
+	}
 	handle, err := os.Open(directory)
 	if err != nil {
-		return
+		return fmt.Errorf("alitycs: open persistence directory for sync: %w", err)
 	}
-	defer handle.Close()
-	_ = handle.Sync()
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	if syncErr != nil {
+		return fmt.Errorf("alitycs: sync persistence directory: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("alitycs: close persistence directory: %w", closeErr)
+	}
+	return nil
 }
