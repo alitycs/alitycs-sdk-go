@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: "3.3.12"
+      - name: Verify governance policy
+        run: |
+          ./scripts/verify-workflow-pins.rb
+          ./scripts/test-coderabbit-policy.rb
+      - name: Detect CodeRabbit validation input changes
+        id: coderabbit-config
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          validation_paths=(
+            ".coderabbit.yaml"
+            "scripts/coderabbit-schema.v2.json"
+            "scripts/coderabbit-validator-requirements.txt"
+            "scripts/validate-coderabbit.sh"
+          )
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]] &&
+            git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- "${validation_paths[@]}"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Python for policy validation
+        if: steps.coderabbit-config.outputs.changed == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.7"
+      - name: Validate CodeRabbit configuration
+        if: steps.coderabbit-config.outputs.changed == 'true'
+        run: ./scripts/validate-coderabbit.sh
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test race safety and coverage
+        run: |
+          go test -race ./...
+          ./scripts/check-coverage.sh
