@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -38,7 +39,7 @@ func newTestBatcher(flushSize, queueLimit int, send func(ctx context.Context, pa
 		flushSize:     flushSize,
 		flushInterval: 0,
 		maxQueueSize:  queueLimit,
-	}, send, func(context.Context) error { return nil }, func() int { return 0 }, false)
+	}, send, nil, func(context.Context) error { return nil }, func() int { return 0 }, false)
 }
 
 func testEvent(name string) Event {
@@ -130,6 +131,82 @@ func TestBatcherStopDeliversEverythingInChunks(t *testing.T) {
 	}
 	if delivered != total {
 		t.Fatalf("stop delivered %d of %d events — lost in drain", delivered, total)
+	}
+}
+
+func TestBatcherShutdownPersistsAcceptedEventsAfterRecoveryFailure(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	var durablePending atomic.Int64
+	var persisted []string
+	var sendCalls atomic.Int64
+	persist := func(payload *BatchPayload) error {
+		for _, event := range payload.Events {
+			persisted = append(persisted, event.Event)
+		}
+		durablePending.Add(int64(len(payload.Events)))
+		return nil
+	}
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error {
+			sendCalls.Add(1)
+			return errors.New("network send must not run after recovery fails")
+		},
+		persist,
+		func(context.Context) error { return recoveryErr },
+		func() int { return int(durablePending.Load()) },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second", "third"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var undelivered *UndeliveredError
+	if !errors.As(err, &undelivered) || undelivered.Undelivered != 3 {
+		t.Fatalf("waitDone = %v, want UndeliveredError with 3 persisted events", err)
+	}
+	if sendCalls.Load() != 0 {
+		t.Fatalf("network sends = %d, want zero after recovery failure", sendCalls.Load())
+	}
+	want := []string{"first", "second", "third"}
+	if len(persisted) != len(want) {
+		t.Fatalf("persisted = %v, want %v", persisted, want)
+	}
+	for index := range want {
+		if persisted[index] != want[index] {
+			t.Fatalf("persisted = %v, want FIFO order %v", persisted, want)
+		}
+	}
+}
+
+func TestBatcherShutdownReportsEventsWhenRecoveryAndPersistenceFail(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	persistenceErr := errors.New("persist pending batch failed")
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error { return nil },
+		func(*BatchPayload) error { return persistenceErr },
+		func(context.Context) error { return recoveryErr },
+		func() int { return 0 },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Lost != 2 || !errors.Is(err, persistenceErr) {
+		t.Fatalf("waitDone = %v, want LostEventsError with 2 events and persistence cause", err)
 	}
 }
 

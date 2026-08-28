@@ -375,6 +375,9 @@ func TestParseRetryAfter(t *testing.T) {
 	if got, ok := parseRetryAfter("120", now); !ok || got != 120*time.Second {
 		t.Errorf("delta-seconds = %s (%v), want 2m0s", got, ok)
 	}
+	if got, ok := parseRetryAfter("9223372037", now); !ok || got != time.Duration(1<<63-1) {
+		t.Errorf("oversized delta-seconds = %s (%v), want saturated duration", got, ok)
+	}
 	if _, ok := parseRetryAfter("-5", now); ok {
 		t.Error("negative delta-seconds must be rejected")
 	}

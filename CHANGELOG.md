@@ -11,7 +11,8 @@ here before a version tag is created.
 - Optional `WithPersistence(path)` exact-batch write-ahead logging. A serialized in-flight batch
   is stored atomically before its first attempt and replayed byte-identically after restart,
   including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
-  pre-flush in-memory events remain outside this durability boundary.
+  pre-flush events remain in memory during normal operation and are appended in FIFO order during
+  shutdown if recovery of existing WAL records fails.
 
 ### Changed
 - Retry backoff is now jittered ±20% so many clients retrying after a shared failure do not hit
@@ -42,6 +43,9 @@ here before a version tag is created.
 - HTTP 400 isolation is capped at 64 sends, preventing a large rejected batch from amplifying into
   an unbounded request storm. Concurrent admission now reserves queue capacity atomically and
   includes retained durable events in the budget.
+- Terminal rejections of persisted single events now count in `Stats().Failed` and
+  `LostEventsError` after their WAL records are removed; shutdown reports any accepted events that
+  cannot be appended to the WAL after a recovery failure.
 
 [Unreleased]: https://github.com/alitycs/alitycs-sdk-go/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/alitycs/alitycs-sdk-go/releases/tag/v1.0.0

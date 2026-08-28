@@ -65,6 +65,7 @@ type batcher struct {
 	doneCh        chan struct{}
 
 	send           func(ctx context.Context, payload *BatchPayload) error
+	persist        func(payload *BatchPayload) error
 	recover        func(ctx context.Context) error
 	durablePending func() int
 	durable        bool
@@ -87,6 +88,7 @@ type batcher struct {
 func newBatcher(
 	cfg *config,
 	send func(ctx context.Context, payload *BatchPayload) error,
+	persist func(payload *BatchPayload) error,
 	recoverFn func(ctx context.Context) error,
 	durablePending func() int,
 	durable bool,
@@ -97,6 +99,7 @@ func newBatcher(
 		stopCh:         make(chan struct{}),
 		doneCh:         make(chan struct{}),
 		send:           send,
+		persist:        persist,
 		recover:        recoverFn,
 		durablePending: durablePending,
 		durable:        durable,
@@ -277,6 +280,8 @@ func (b *batcher) loop() {
 func (b *batcher) finish(ctx context.Context) {
 	if err := b.recover(ctx); err != nil {
 		b.lastCause = err
+		debugLog(b.debug, "durable recovery failed during shutdown — preserving newly queued events: %v", err)
+		b.persistPending()
 		return
 	}
 	for {
@@ -293,6 +298,38 @@ func (b *batcher) finish(ctx context.Context) {
 		if err := b.sendChunk(ctx, chunk); err != nil {
 			debugLog(b.debug, "shutdown lost %d events: %v", len(chunk), err)
 		}
+	}
+}
+
+// persistPending transfers every accepted in-memory event to the durable store
+// without attempting network delivery. It is used only after recovery fails,
+// so existing WAL records retain FIFO precedence over newly accepted events.
+func (b *batcher) persistPending() {
+	b.drainChannel()
+	for len(b.pending) > 0 {
+		size := b.flushSize
+		if size > len(b.pending) {
+			size = len(b.pending)
+		}
+		chunk := b.pending[:size]
+		b.pending = b.pending[size:]
+		payload := &BatchPayload{
+			BatchID: prefixBatch + generateID(),
+			SentAt:  nowMillis(),
+			Events:  chunk,
+		}
+		err := errors.New("alitycs: durable persistence is unavailable")
+		if b.durable && b.persist != nil {
+			err = b.persist(payload)
+		}
+		b.unsent.Add(-int64(len(chunk)))
+		if err != nil {
+			b.failed.Add(int64(len(chunk)))
+			b.lastCause = err
+			warnLog("shutdown could not persist %d accepted events: %v", len(chunk), err)
+			continue
+		}
+		debugLog(b.debug, "shutdown retained %d accepted events for restart", len(chunk))
 	}
 }
 

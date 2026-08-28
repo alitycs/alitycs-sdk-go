@@ -42,22 +42,39 @@ type transport struct {
 // marshalled once and the identical body is retried so a batch keeps its
 // batchId across attempts — only the timing changes between attempts.
 func (t *transport) send(ctx context.Context, payload *BatchPayload) error {
-	body, err := json.Marshal(payload)
+	record, err := durableRecord(payload)
 	if err != nil {
-		return fmt.Errorf("alitycs: encode batch: %w", err)
-	}
-
-	record := durableBatchRecord{
-		BatchID: payload.BatchID, Body: string(body), EventCount: len(payload.Events),
+		return err
 	}
 	if err := t.store.put(record); err != nil {
 		return err
 	}
 	err = t.sendRecord(ctx, record)
 	if err != nil && t.store.enabled() {
-		return &durableBatchError{cause: err}
+		var terminal *terminalStatusError
+		if !errors.As(err, &terminal) {
+			return &durableBatchError{cause: err}
+		}
 	}
 	return err
+}
+
+func (t *transport) persist(payload *BatchPayload) error {
+	record, err := durableRecord(payload)
+	if err != nil {
+		return err
+	}
+	return t.store.put(record)
+}
+
+func durableRecord(payload *BatchPayload) (durableBatchRecord, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return durableBatchRecord{}, fmt.Errorf("alitycs: encode batch: %w", err)
+	}
+	return durableBatchRecord{
+		BatchID: payload.BatchID, Body: string(body), EventCount: len(payload.Events),
+	}, nil
 }
 
 // durableBatchError proves the exact body is already owned by the WAL.

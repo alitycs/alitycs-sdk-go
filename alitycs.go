@@ -66,7 +66,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		sessions:    newSessionManager(cfg.sessionTimeout),
 		globals:     make(Props),
 	}
-	c.batch = newBatcher(cfg, t.send, t.recover, store.pendingEvents, store.enabled())
+	c.batch = newBatcher(cfg, t.send, t.persist, t.recover, store.pendingEvents, store.enabled())
 	c.batch.start()
 	return c, nil
 }

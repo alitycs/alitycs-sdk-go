@@ -184,3 +184,40 @@ func TestTransportRecoveryHonoursPersistedRetryAfter(t *testing.T) {
 		t.Fatalf("waited %s, want remaining Retry-After", waited)
 	}
 }
+
+func TestPersistentTerminalRejectionCountsAsFailedAndLeavesNoWALRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "wal.json")
+	client, err := New(
+		"pk_test",
+		WithEndpoint(server.URL),
+		WithFlushSize(100),
+		WithFlushInterval(0),
+		WithMaxRetries(0),
+		WithPersistence(path),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Track(context.Background(), "terminal", nil)
+
+	err = client.Shutdown(context.Background())
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Lost != 1 {
+		t.Fatalf("Shutdown = %v, want LostEventsError with one terminal rejection", err)
+	}
+	if stats := client.Stats(); stats.Failed != 1 || stats.Delivered != 0 {
+		t.Fatalf("Stats = %+v, want one failed and zero delivered", stats)
+	}
+	restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.pendingEvents(); got != 0 {
+		t.Fatalf("pending WAL events = %d, want terminal rejection removed", got)
+	}
+}
