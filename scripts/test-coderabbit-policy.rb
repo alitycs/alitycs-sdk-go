@@ -69,12 +69,22 @@ workflow_runs = lambda do |workflow|
 end
 
 shell_lines = lambda do |run|
-  run.each_line.filter_map do |line|
+  logical_lines = []
+  continued = +""
+  run.each_line.each do |line|
     stripped = line.strip
-    next if stripped.empty? || stripped.start_with?("#")
+    next if continued.empty? && (stripped.empty? || stripped.start_with?("#"))
 
-    stripped
+    if stripped.end_with?("\\")
+      continued << stripped.delete_suffix("\\").rstrip << " "
+      next
+    end
+    logical = (continued + stripped).strip
+    logical_lines << logical unless logical.empty? || logical.start_with?("#")
+    continued.clear
   end
+  logical_lines << continued.strip unless continued.strip.empty?
+  logical_lines
 end
 
 executable_reference = lambda do |runs, command|
@@ -154,6 +164,12 @@ early_release_step = { "name" => "Publish early", "run" => release_command }
 fixture_steps = [early_release_step, create_step].compact
 if create_step && unique_release_creation_step.call(fixture_steps, create_step)
   failures << "release creation in an earlier step must not count"
+end
+continued_release = release_command.sub("gh release create", "gh release #{0x5c.chr}\n  create")
+continued_release_step = { "name" => "Publish with continuation", "run" => continued_release }
+continued_fixture_steps = [continued_release_step, create_step].compact
+if create_step && unique_release_creation_step.call(continued_fixture_steps, create_step)
+  failures << "line-continued release creation must not count"
 end
 identity_checks_without_fetch = tag_identity_sequence.drop(1)
 failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
