@@ -134,13 +134,19 @@ tag_identity_rechecked = lambda do |lines|
 end
 release_command = 'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes'
 release_created_after_recheck = lambda do |lines|
-  expected = tag_identity_sequence + [release_command]
-  lines.each_cons(expected.length).any? { |sequence| sequence == expected }
+  release_indexes = lines.each_index.select { |index| lines[index] == release_command }
+  next false unless release_indexes.length == 1
+
+  release_index = release_indexes.first
+  release_index >= tag_identity_sequence.length &&
+    lines[(release_index - tag_identity_sequence.length)...release_index] == tag_identity_sequence
 end
 identity_checks_without_fetch = tag_identity_sequence.drop(1)
 failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
 interrupted_creation = tag_identity_sequence + ["echo stale-window", release_command]
 failures << "stale tag-check windows must not count" if release_created_after_recheck.call(interrupted_creation)
+duplicate_creation = [release_command] + tag_identity_sequence + [release_command]
+failures << "early release creation must not count" if release_created_after_recheck.call(duplicate_creation)
 unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
 end
