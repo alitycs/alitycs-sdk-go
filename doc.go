@@ -14,6 +14,14 @@
 //	client.Identify(ctx, "usr_1842", alitycs.Props{"plan": "pro"})
 //	err = client.Flush(ctx)
 //
+// Long-lived servers that share one client across concurrent requests should
+// scope identity to each event instead of mutating ambient state:
+//
+//	client.Track(ctx, "checkout_started", nil, alitycs.WithUserID(requestUserID))
+//
+// WithUserID is accepted by Track, Page, CaptureError and TrackRevenue and does
+// not change the identity used by any other call.
+//
 // Every method is safe for concurrent use. Track, Identify, Page, CaptureError
 // and TrackRevenue enqueue synchronously and never block on network I/O; a
 // single background goroutine owns batching, retrying and sending.
@@ -43,6 +51,19 @@
 // rejection — the batch is split in half and each half retried recursively so
 // valid events still land. Retries reuse the identical marshalled body so a
 // batch keeps its batchId for server-side dedup.
+//
+// WithPersistence(path) enables an exact in-flight batch write-ahead log. The
+// serialized body is atomically stored immediately before its first network
+// attempt; an exhausted transient failure remains for the next process to
+// replay during Flush or Shutdown, including any remaining Retry-After pause.
+// Terminal responses acknowledge and remove it; recovered terminal rejections
+// count in Stats().Failed and Shutdown's LostEventsError. If older WAL recovery
+// is blocked during Shutdown, accepted pre-flush events are appended in FIFO order.
+// The WAL is capped at maxQueueSize retained events, and one client process must
+// own a given path. SDK-generated exponential backoff is capped at 10 seconds;
+// an explicit server Retry-After is capped at one minute and paused recovery is
+// deferred instead of sleeping on the single batcher goroutine. HTTP 400 split
+// isolation is bounded to 64 sends per original batch.
 //
 // # Contexts
 //

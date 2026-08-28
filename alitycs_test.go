@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -33,6 +34,7 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		{"flush interval", WithFlushInterval(-time.Second), "interval"},
 		{"queue size", WithMaxQueueSize(0), "queue size"},
 		{"retries", WithMaxRetries(-1), "retries"},
+		{"persistence", WithPersistence("  "), "persistence"},
 		{"session timeout", WithSessionTimeout(0), "session timeout"},
 		{"http client", WithHTTPClient(nil), "http client"},
 	}
@@ -221,6 +223,84 @@ func TestWithUserIDOverridesSingleEvent(t *testing.T) {
 	event := capture.eventByName("override")
 	if event.UserID != "usr_other" {
 		t.Errorf("userId = %q, want the per-call override", event.UserID)
+	}
+}
+
+func TestSharedClientKeepsConcurrentPerCallUsersIsolated(t *testing.T) {
+	client, capture := newTestClient(t, WithFlushSize(1000))
+
+	var wg sync.WaitGroup
+	for index := 0; index < 50; index++ {
+		for _, request := range []struct {
+			prefix string
+			userID string
+		}{
+			{prefix: "request_a", userID: "usr_request_a"},
+			{prefix: "request_b", userID: "usr_request_b"},
+		} {
+			wg.Add(1)
+			go func(index int, prefix, userID string) {
+				defer wg.Done()
+				client.Track(
+					context.Background(),
+					fmt.Sprintf("%s_%d", prefix, index),
+					nil,
+					WithUserID(userID),
+				)
+			}(index, request.prefix, request.userID)
+		}
+	}
+	wg.Wait()
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	waitForRequests(t, capture, 1)
+
+	events := capture.events()
+	if len(events) != 100 {
+		t.Fatalf("delivered %d events, want 100", len(events))
+	}
+	for _, event := range events {
+		expected := "usr_request_b"
+		if strings.HasPrefix(event.Event, "request_a_") {
+			expected = "usr_request_a"
+		}
+		if event.UserID != expected {
+			t.Errorf("%s userId = %q, want %q", event.Event, event.UserID, expected)
+		}
+	}
+}
+
+func TestWithUserIDAppliesToEveryEventAPI(t *testing.T) {
+	client, capture := newTestClient(t, WithFlushSize(10))
+	revenue, err := NewTransaction("scoped_fact", "5.00", "USD")
+	if err != nil {
+		t.Fatalf("NewTransaction: %v", err)
+	}
+
+	client.Track(context.Background(), "scoped_track", nil, WithUserID("usr_track"))
+	client.CaptureError(context.Background(), "scoped_error", nil, WithUserID("usr_error"))
+	client.Page(context.Background(), "scoped_page", nil, WithUserID("usr_page"))
+	client.TrackRevenue(context.Background(), revenue, nil, WithUserID("usr_revenue"))
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	waitForRequests(t, capture, 1)
+
+	expected := map[string]string{
+		"scoped_track":        "usr_track",
+		"scoped_error":        "usr_error",
+		"scoped_page":         "usr_page",
+		"revenue_transaction": "usr_revenue",
+	}
+	for _, event := range capture.events() {
+		if event.UserID != expected[event.Event] {
+			t.Errorf("%s userId = %q, want %q", event.Event, event.UserID, expected[event.Event])
+		}
+		delete(expected, event.Event)
+	}
+	if len(expected) != 0 {
+		t.Errorf("missing scoped events: %v", expected)
 	}
 }
 
@@ -518,6 +598,13 @@ func TestShutdownDeadlineReportsUndelivered(t *testing.T) {
 		t.Fatalf("final Shutdown: %v", err)
 	}
 	waitForRequests(t, capture, 1)
+}
+
+func TestUndeliveredErrorOmitsNilCause(t *testing.T) {
+	err := (&UndeliveredError{Undelivered: 2}).Error()
+	if strings.Contains(err, "<nil>") || !strings.Contains(err, "2 events not yet delivered") {
+		t.Fatalf("UndeliveredError = %q", err)
+	}
 }
 
 // TestConcurrentUseIsRaceFree exercises interleaved Track/Flush/Shutdown from

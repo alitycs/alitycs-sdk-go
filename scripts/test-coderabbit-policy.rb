@@ -68,14 +68,34 @@ workflow_runs = lambda do |workflow|
   end
 end
 
-executable_reference = lambda do |runs, command|
-  runs.any? do |run|
-    run.lines.any? do |line|
-      stripped = line.strip
-      !stripped.empty? && !stripped.start_with?("#") && stripped.include?(command)
+shell_lines = lambda do |run|
+  logical_lines = []
+  continued = +""
+  run.each_line.each do |line|
+    stripped = line.strip
+    next if continued.empty? && (stripped.empty? || stripped.start_with?("#"))
+
+    if stripped.end_with?("\\")
+      continued << stripped.delete_suffix("\\").rstrip << " "
+      next
     end
+    logical = (continued + stripped).strip
+    logical_lines << logical unless logical.empty? || logical.start_with?("#")
+    continued.clear
   end
+  logical_lines << continued.strip unless continued.strip.empty?
+  logical_lines
 end
+
+executable_reference = lambda do |runs, command|
+  invocation = /\A(?:command\s+|exec\s+)?#{Regexp.escape(command)}\z/
+  runs.any? { |run| shell_lines.call(run).any? { |line| line.match?(invocation) } }
+end
+
+probe_command = "./scripts/test-coderabbit-policy.rb"
+failures << "commented policy commands must not count" if executable_reference.call(["# #{probe_command}"], probe_command)
+failures << "echoed policy commands must not count" if executable_reference.call(["echo #{probe_command}"], probe_command)
+failures << "ignored policy failures must not count" if executable_reference.call(["#{probe_command} || true"], probe_command)
 
 ci_runs = workflow_runs.call(ci_data)
 {
@@ -94,15 +114,84 @@ verify_step = build_steps&.find { |step| step.is_a?(Hash) && step["id"] == "veri
 recheck_step = release_steps&.find do |step|
   step.is_a?(Hash) && step["name"] == "Recheck immutable release tag"
 end
+create_step = release_steps&.find { |step| step.is_a?(Hash) && step["name"] == "Create GitHub Release" }
 verify_run = verify_step.is_a?(Hash) ? verify_step["run"].to_s : ""
 recheck_run = recheck_step.is_a?(Hash) ? recheck_step["run"].to_s : ""
-unless verify_run.include?("git cat-file -t") && verify_run.include?("^{tag}")
+create_run = create_step.is_a?(Hash) ? create_step["run"].to_s : ""
+verify_lines = shell_lines.call(verify_run)
+recheck_lines = shell_lines.call(recheck_run)
+create_lines = shell_lines.call(create_run)
+release_creation_reference = lambda do |step|
+  run = step.is_a?(Hash) ? step["run"] : nil
+  run.is_a?(String) && shell_lines.call(run).any? { |line| line.match?(/\bgh\s+release\s+create\b/) }
+end
+unique_release_creation_step = lambda do |steps, expected_step|
+  next false unless steps.is_a?(Array) && expected_step
+
+  creation_indexes = steps.each_index.select { |index| release_creation_reference.call(steps[index]) }
+  expected_index = steps.index(expected_step)
+  creation_indexes.length == 1 && creation_indexes.first == expected_index
+end
+tag_guard = 'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then'
+guard_start = verify_lines.index(tag_guard)
+guard_end = guard_start && verify_lines.each_index.find { |index| index > guard_start && verify_lines[index] == "fi" }
+guard_fails = guard_start && guard_end && verify_lines[(guard_start + 1)...guard_end].any? do |line|
+  line.match?(/\Aexit\s+[1-9][0-9]*\z/)
+end
+unless guard_fails &&
+    verify_lines.include?('tag_object="$(git rev-parse "${GITHUB_REF}^{tag}")"') &&
+    verify_lines.include?('tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"') &&
+    verify_lines.include?('[[ "$tag_commit" == "$GITHUB_SHA" ]]')
   failures << "release must require annotated tags"
 end
-unless recheck_run.include?("EXPECTED_TAG_OBJECT") &&
-    recheck_run.include?("EXPECTED_TAG_COMMIT") &&
-    recheck_run.include?("git rev-parse")
+tag_identity_sequence = [
+  'git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"',
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
+  '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
+  '[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]',
+]
+tag_identity_rechecked = lambda do |lines|
+  lines.each_cons(tag_identity_sequence.length).any? { |sequence| sequence == tag_identity_sequence }
+end
+release_command = 'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes'
+release_created_after_recheck = lambda do |lines|
+  lines == tag_identity_sequence + [release_command]
+end
+unless unique_release_creation_step.call(release_steps, create_step)
+  failures << "release creation must occur in exactly one reviewed step"
+end
+early_release_step = { "name" => "Publish early", "run" => release_command }
+fixture_steps = [early_release_step, create_step].compact
+if create_step && unique_release_creation_step.call(fixture_steps, create_step)
+  failures << "release creation in an earlier step must not count"
+end
+continued_release = release_command.sub("gh release create", "gh release #{0x5c.chr}\n  create")
+continued_release_step = { "name" => "Publish with continuation", "run" => continued_release }
+continued_fixture_steps = [continued_release_step, create_step].compact
+if create_step && unique_release_creation_step.call(continued_fixture_steps, create_step)
+  failures << "line-continued release creation must not count"
+end
+identity_checks_without_fetch = tag_identity_sequence.drop(1)
+failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
+interrupted_creation = tag_identity_sequence + ["echo stale-window", release_command]
+failures << "stale tag-check windows must not count" if release_created_after_recheck.call(interrupted_creation)
+duplicate_creation = [release_command] + tag_identity_sequence + [release_command]
+failures << "early release creation must not count" if release_created_after_recheck.call(duplicate_creation)
+prefixed_creation = ["command #{release_command}"] + tag_identity_sequence + [release_command]
+failures << "prefixed release creation must not count" if release_created_after_recheck.call(prefixed_creation)
+[
+  "#{release_command} # publish",
+  "env #{release_command}",
+  "GH_TOKEN=token #{release_command}",
+].each do |unapproved_invocation|
+  fixture = [unapproved_invocation] + tag_identity_sequence + [release_command]
+  failures << "unapproved release creation must not count" if release_created_after_recheck.call(fixture)
+end
+unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
+end
+unless release_created_after_recheck.call(create_lines)
+  failures << "release must recheck immutable tag immediately before creation"
 end
 failures << "release workflow must not use concurrency" if release_data.key?("concurrency")
 

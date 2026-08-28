@@ -64,11 +64,15 @@ type batcher struct {
 	stopCh        chan struct{}
 	doneCh        chan struct{}
 
-	send       func(ctx context.Context, payload *BatchPayload) error
-	flushSize  int
-	interval   time.Duration
-	queueLimit int
-	debug      bool
+	send           func(ctx context.Context, payload *BatchPayload) error
+	persist        func(payload *BatchPayload) error
+	recover        func(ctx context.Context) error
+	durablePending func() int
+	durable        bool
+	flushSize      int
+	interval       time.Duration
+	queueLimit     int
+	debug          bool
 
 	enqueued  atomic.Int64 // accepted into the queue
 	delivered atomic.Int64 // accepted by the endpoint
@@ -77,22 +81,43 @@ type batcher struct {
 	failed    atomic.Int64 // exhausted retries in a background send
 	unsent    atomic.Int64 // in the channel or in pending, awaiting an outcome
 
+	// recoveryOwned tracks the still-pending events loaded when this process
+	// started. recoveryFailed is the subset of Failed originating outside this
+	// process, so shutdown deadline reporting can count unique current and
+	// restart-owned events without double-counting either group.
+	recoveryOwned  atomic.Int64
+	recoveryFailed atomic.Int64
+	durableCurrent atomic.Int64
+
 	pending   []Event // owned by the loop goroutine only
 	lastCause error   // most recent send failure; read only after doneCh closes
 }
 
-func newBatcher(cfg *config, send func(ctx context.Context, payload *BatchPayload) error) *batcher {
-	return &batcher{
-		events:        make(chan inbound, cfg.maxQueueSize),
-		flushRequests: make(chan flushRequest, defaultMaxQueueSize),
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		send:          send,
-		flushSize:     cfg.flushSize,
-		interval:      cfg.flushInterval,
-		queueLimit:    cfg.maxQueueSize,
-		debug:         cfg.debug,
+func newBatcher(
+	cfg *config,
+	send func(ctx context.Context, payload *BatchPayload) error,
+	persist func(payload *BatchPayload) error,
+	recoverFn func(ctx context.Context) error,
+	durablePending func() int,
+	durable bool,
+) *batcher {
+	b := &batcher{
+		events:         make(chan inbound, cfg.maxQueueSize),
+		flushRequests:  make(chan flushRequest, defaultMaxQueueSize),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		send:           send,
+		persist:        persist,
+		recover:        recoverFn,
+		durablePending: durablePending,
+		durable:        durable,
+		flushSize:      cfg.flushSize,
+		interval:       cfg.flushInterval,
+		queueLimit:     cfg.maxQueueSize,
+		debug:          cfg.debug,
 	}
+	b.recoveryOwned.Store(int64(durablePending()))
+	return b
 }
 
 // start launches the loop goroutine.
@@ -107,17 +132,24 @@ func (b *batcher) enqueue(event Event, ctx context.Context) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if b.unsent.Load() >= int64(b.queueLimit) {
-		b.dropped.Add(1)
-		debugLog(b.debug, "queue full (%d) — dropping event %s", b.queueLimit, event.EventID)
-		return false
+	for {
+		current := b.unsent.Load()
+		uniquePending := current + b.recoveryOwned.Load() + b.durableCurrent.Load()
+		if uniquePending >= int64(b.queueLimit) {
+			b.dropped.Add(1)
+			debugLog(b.debug, "queue full (%d) — dropping event %s", b.queueLimit, event.EventID)
+			return false
+		}
+		if b.unsent.CompareAndSwap(current, current+1) {
+			break
+		}
 	}
 	select {
 	case b.events <- inbound{event: event, ctx: ctx}:
 		b.enqueued.Add(1)
-		b.unsent.Add(1)
 		return true
 	default:
+		b.unsent.Add(-1)
 		b.dropped.Add(1)
 		debugLog(b.debug, "queue channel full — dropping event %s", event.EventID)
 		return false
@@ -164,17 +196,33 @@ func (b *batcher) stop() {
 func (b *batcher) waitDone(ctx context.Context) error {
 	select {
 	case <-b.doneCh:
+		pending := b.durablePending()
 		failed := b.failed.Load()
 		rejected := b.rejected.Load()
+		if pending > 0 && (failed > 0 || rejected > 0) {
+			return errors.Join(
+				&UndeliveredError{Undelivered: pending, Cause: b.lastCause},
+				&LostEventsError{Lost: failed, Rejected: rejected, Cause: b.lastCause},
+			)
+		}
+		if pending > 0 {
+			return &UndeliveredError{Undelivered: pending, Cause: b.lastCause}
+		}
 		if failed > 0 || rejected > 0 {
 			return &LostEventsError{Lost: failed, Rejected: rejected, Cause: b.lastCause}
 		}
 		return nil
 	case <-ctx.Done():
-		return &UndeliveredError{
-			Undelivered: int(b.enqueued.Load() - b.delivered.Load()),
+		undelivered := &UndeliveredError{
+			Undelivered: b.undeliveredAtDeadline(),
 			Cause:       ctx.Err(),
 		}
+		failed := b.failed.Load()
+		rejected := b.rejected.Load()
+		if failed > 0 || rejected > 0 {
+			return errors.Join(undelivered, &LostEventsError{Lost: failed, Rejected: rejected})
+		}
+		return undelivered
 	}
 }
 
@@ -232,6 +280,9 @@ func (b *batcher) loop() {
 				// events stream in; anything extra waits its turn. The
 				// send answers to the call that completed the batch —
 				// its ctx can cancel or deadline the dispatch.
+				if _, blocked := b.recoverBeforeSend(in.ctx); blocked != nil {
+					break
+				}
 				chunk := b.pending[:b.flushSize]
 				b.pending = b.pending[b.flushSize:]
 				b.sendChunk(in.ctx, chunk)
@@ -250,6 +301,11 @@ func (b *batcher) loop() {
 // finish drains everything still queued after stop and sends it in batches of
 // flushSize. Losses are counted by sendChunk and reported through waitDone.
 func (b *batcher) finish(ctx context.Context) {
+	if _, blocked := b.recoverBeforeSend(ctx); blocked != nil {
+		debugLog(b.debug, "durable recovery failed during shutdown — preserving newly queued events: %v", blocked)
+		b.persistPending()
+		return
+	}
 	for {
 		b.drainChannel()
 		if len(b.pending) == 0 {
@@ -262,8 +318,50 @@ func (b *batcher) finish(ctx context.Context) {
 		chunk := b.pending[:size]
 		b.pending = b.pending[size:]
 		if err := b.sendChunk(ctx, chunk); err != nil {
-			debugLog(b.debug, "shutdown lost %d events: %v", len(chunk), err)
+			var delivered *deliveredBatchError
+			if errors.As(err, &delivered) {
+				debugLog(b.debug, "shutdown delivered %d events with a WAL sync warning: %v", len(chunk), err)
+			} else {
+				debugLog(b.debug, "shutdown lost %d events: %v", len(chunk), err)
+			}
 		}
+	}
+}
+
+// persistPending transfers every accepted in-memory event to the durable store
+// without attempting network delivery. It is used only after recovery fails,
+// so existing WAL records retain FIFO precedence over newly accepted events.
+func (b *batcher) persistPending() {
+	b.drainChannel()
+	for len(b.pending) > 0 {
+		size := b.flushSize
+		if size > len(b.pending) {
+			size = len(b.pending)
+		}
+		chunk := b.pending[:size]
+		b.pending = b.pending[size:]
+		payload := &BatchPayload{
+			BatchID: prefixBatch + generateID(),
+			SentAt:  nowMillis(),
+			Events:  chunk,
+		}
+		err := errors.New("alitycs: durable persistence is unavailable")
+		if b.durable && b.persist != nil {
+			err = b.persist(payload)
+		}
+		b.unsent.Add(-int64(len(chunk)))
+		var retained *durableBatchError
+		if err != nil && !errors.As(err, &retained) {
+			b.failed.Add(int64(len(chunk)))
+			b.lastCause = err
+			warnLog("shutdown could not persist %d accepted events: %v", len(chunk), err)
+			continue
+		}
+		b.durableCurrent.Add(int64(len(chunk)))
+		if err != nil {
+			b.lastCause = err
+		}
+		debugLog(b.debug, "shutdown retained %d accepted events for restart", len(chunk))
 	}
 }
 
@@ -286,8 +384,11 @@ func (b *batcher) drainChannel() {
 // empty queue sends nothing; flushes never fabricate empty requests. The
 // first terminal failure is returned after every chunk has had its turn.
 func (b *batcher) sendPending(ctx context.Context) error {
+	firstErr, blocked := b.recoverBeforeSend(ctx)
+	if blocked != nil {
+		return blocked
+	}
 	b.drainChannel()
-	var firstErr error
 	for len(b.pending) > 0 {
 		size := b.flushSize
 		if size > len(b.pending) {
@@ -302,9 +403,68 @@ func (b *batcher) sendPending(ctx context.Context) error {
 	return firstErr
 }
 
-// maxSplitDepth bounds the recursion of whole-batch rejection splitting; deep
-// enough for ~2^32 events, far beyond any queue limit.
-const maxSplitDepth = 32
+// recoverBeforeSend records permanently rejected recovered events exactly once.
+// A terminal-only recovery outcome is reportable but does not block newer work;
+// deferred or transient recovery errors preserve WAL-first delivery ordering.
+func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocked error) {
+	err := b.recover(ctx)
+	b.updateRecoveryOwned()
+	if err == nil {
+		return nil, nil
+	}
+	b.lastCause = err
+	var outcome *recoveryOutcomeError
+	if errors.As(err, &outcome) {
+		if !outcome.reported {
+			b.failed.Add(outcome.Lost)
+			b.recoveryFailed.Add(outcome.Lost)
+		}
+		if !outcome.Blocked {
+			return err, nil
+		}
+	}
+	return nil, err
+}
+
+func (b *batcher) recordRecoveryProgress(resolved int64, lost int64) {
+	initial := b.recoveryOwned.Load() > 0
+	if lost > 0 {
+		b.failed.Add(lost)
+		if initial {
+			b.recoveryFailed.Add(lost)
+		}
+	}
+	if !initial && resolved > 0 {
+		b.durableCurrent.Add(-resolved)
+		if lost == 0 {
+			b.delivered.Add(resolved)
+		}
+	}
+	b.updateRecoveryOwned()
+}
+
+func (b *batcher) updateRecoveryOwned() {
+	remaining := int64(b.durablePending())
+	for {
+		owned := b.recoveryOwned.Load()
+		if remaining >= owned || b.recoveryOwned.CompareAndSwap(owned, remaining) {
+			return
+		}
+	}
+}
+
+func (b *batcher) undeliveredAtDeadline() int {
+	currentFailed := b.failed.Load() - b.recoveryFailed.Load()
+	currentOutstanding := b.enqueued.Load() - b.delivered.Load() - currentFailed
+	if currentOutstanding < 0 {
+		currentOutstanding = 0
+	}
+	return int(b.recoveryOwned.Load() + currentOutstanding)
+}
+
+// maxSplitSends bounds whole-batch rejection isolation so one response cannot
+// amplify into an unbounded request storm under a very large flush size.
+const maxSplitSends = 64
 
 // batchRejectStatus is the HTTP status the ingest endpoint answers with when it
 // rejects an entire batch over a single invalid event.
@@ -312,7 +472,8 @@ const batchRejectStatus = http.StatusBadRequest
 
 // sendChunk sends one payload and resolves its fate.
 func (b *batcher) sendChunk(ctx context.Context, events []Event) error {
-	return b.deliver(ctx, events, 0)
+	remainingSends := maxSplitSends
+	return b.deliver(ctx, events, &remainingSends)
 }
 
 // deliver sends one payload and resolves its fate. On an HTTP 400 the server
@@ -320,7 +481,16 @@ func (b *batcher) sendChunk(ctx context.Context, events []Event) error {
 // chunk is split in half and each half retried recursively until only valid
 // singles remain. Any other failure counts the chunk as lost: retries already
 // ran inside send, and re-queueing a refused event would poison future batches.
-func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error {
+func (b *batcher) deliver(ctx context.Context, events []Event, remainingSends *int) error {
+	if *remainingSends <= 0 {
+		err := errors.New("alitycs: batch rejection split limit reached")
+		b.unsent.Add(-int64(len(events)))
+		b.failed.Add(int64(len(events)))
+		b.lastCause = err
+		warnLog("batch rejection split limit reached — dropping %d unresolved events", len(events))
+		return err
+	}
+	(*remainingSends)--
 	payload := &BatchPayload{
 		BatchID: prefixBatch + generateID(),
 		SentAt:  nowMillis(),
@@ -332,15 +502,22 @@ func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error 
 		b.delivered.Add(int64(len(events)))
 		return nil
 	}
+	var delivered *deliveredBatchError
+	if errors.As(err, &delivered) {
+		b.unsent.Add(-int64(len(events)))
+		b.delivered.Add(int64(len(events)))
+		b.lastCause = err
+		return err
+	}
 
 	var terminal *terminalStatusError
 	if errors.As(err, &terminal) && terminal.status == batchRejectStatus &&
-		len(events) > 1 && depth < maxSplitDepth {
+		len(events) > 1 {
 		warnLog("batch %s rejected whole (HTTP %d) — splitting %d events in half and retrying",
 			payload.BatchID, terminal.status, len(events))
 		mid := len(events) / 2
-		leftErr := b.deliver(ctx, events[:mid], depth+1)
-		rightErr := b.deliver(ctx, events[mid:], depth+1)
+		leftErr := b.deliver(ctx, events[:mid], remainingSends)
+		rightErr := b.deliver(ctx, events[mid:], remainingSends)
 		if leftErr != nil {
 			return leftErr
 		}
@@ -348,9 +525,18 @@ func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error 
 	}
 
 	b.unsent.Add(-int64(len(events)))
-	b.failed.Add(int64(len(events)))
+	var retained *durableBatchError
+	if errors.As(err, &retained) {
+		b.durableCurrent.Add(int64(len(events)))
+	} else {
+		b.failed.Add(int64(len(events)))
+	}
 	b.lastCause = err
-	debugLog(b.debug, "batch %s failed after retries — dropping %d events: %v", payload.BatchID, len(events), err)
+	if errors.As(err, &retained) {
+		debugLog(b.debug, "batch %s failed after retries — retaining %d events for restart: %v", payload.BatchID, len(events), err)
+	} else {
+		debugLog(b.debug, "batch %s failed after retries — dropping %d events: %v", payload.BatchID, len(events), err)
+	}
 	return err
 }
 

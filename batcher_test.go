@@ -3,7 +3,9 @@ package alitycs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,7 +39,7 @@ func newTestBatcher(flushSize, queueLimit int, send func(ctx context.Context, pa
 		flushSize:     flushSize,
 		flushInterval: 0,
 		maxQueueSize:  queueLimit,
-	}, send)
+	}, send, nil, func(context.Context) error { return nil }, func() int { return 0 }, false)
 }
 
 func testEvent(name string) Event {
@@ -132,6 +134,114 @@ func TestBatcherStopDeliversEverythingInChunks(t *testing.T) {
 	}
 }
 
+func TestBatcherShutdownPersistsAcceptedEventsAfterRecoveryFailure(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	var durablePending atomic.Int64
+	var persisted []string
+	var sendCalls atomic.Int64
+	persist := func(payload *BatchPayload) error {
+		for _, event := range payload.Events {
+			persisted = append(persisted, event.Event)
+		}
+		durablePending.Add(int64(len(payload.Events)))
+		return nil
+	}
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error {
+			sendCalls.Add(1)
+			return errors.New("network send must not run after recovery fails")
+		},
+		persist,
+		func(context.Context) error { return recoveryErr },
+		func() int { return int(durablePending.Load()) },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second", "third"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var undelivered *UndeliveredError
+	if !errors.As(err, &undelivered) || undelivered.Undelivered != 3 {
+		t.Fatalf("waitDone = %v, want UndeliveredError with 3 persisted events", err)
+	}
+	if sendCalls.Load() != 0 {
+		t.Fatalf("network sends = %d, want zero after recovery failure", sendCalls.Load())
+	}
+	want := []string{"first", "second", "third"}
+	if len(persisted) != len(want) {
+		t.Fatalf("persisted = %v, want %v", persisted, want)
+	}
+	for index := range want {
+		if persisted[index] != want[index] {
+			t.Fatalf("persisted = %v, want FIFO order %v", persisted, want)
+		}
+	}
+}
+
+func TestBatcherShutdownReportsEventsWhenRecoveryAndPersistenceFail(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	persistenceErr := errors.New("persist pending batch failed")
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error { return nil },
+		func(*BatchPayload) error { return persistenceErr },
+		func(context.Context) error { return recoveryErr },
+		func() int { return 0 },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Lost != 2 || !errors.Is(err, persistenceErr) {
+		t.Fatalf("waitDone = %v, want LostEventsError with 2 events and persistence cause", err)
+	}
+}
+
+func TestBatcherShutdownReportsRetainedAndLostEventsTogether(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	persistenceErr := errors.New("persist pending batch failed")
+	var durablePending atomic.Int64
+	durablePending.Store(1)
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error { return nil },
+		func(*BatchPayload) error { return persistenceErr },
+		func(context.Context) error { return recoveryErr },
+		func() int { return int(durablePending.Load()) },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var undelivered *UndeliveredError
+	if !errors.As(err, &undelivered) || undelivered.Undelivered != 1 {
+		t.Fatalf("waitDone = %v, want UndeliveredError with 1 retained event", err)
+	}
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Lost != 2 || !errors.Is(err, persistenceErr) {
+		t.Fatalf("waitDone = %v, want LostEventsError with 2 lost events", err)
+	}
+}
+
 func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	sender := &fakeSend{}
 	b := newTestBatcher(100, 2, sender.send) // no loop started: nothing drains
@@ -160,6 +270,57 @@ func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	}
 	if !b.enqueue(testEvent("d"), context.Background()) {
 		t.Fatal("enqueue after a resolved outcome should fit")
+	}
+}
+
+func TestBatcherClassifiesCommittedPersistenceOutcomes(t *testing.T) {
+	event := testEvent("committed")
+
+	t.Run("retained put", func(t *testing.T) {
+		cause := errors.New("post-commit put sync failed")
+		b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error {
+			return &durableBatchError{cause: cause}
+		})
+		b.unsent.Store(1)
+		if err := b.sendChunk(context.Background(), []Event{event}); !errors.Is(err, cause) {
+			t.Fatalf("sendChunk = %v, want retained cause", err)
+		}
+		if counters := b.counters(); counters.Delivered != 0 || counters.Failed != 0 {
+			t.Fatalf("counters = %+v, want retained without delivery or loss", counters)
+		}
+		if b.durableCurrent.Load() != 1 || b.unsent.Load() != 0 {
+			t.Fatalf("durableCurrent = %d, unsent = %d; want 1, 0", b.durableCurrent.Load(), b.unsent.Load())
+		}
+	})
+
+	t.Run("delivered acknowledgement", func(t *testing.T) {
+		cause := errors.New("post-commit acknowledgement sync failed")
+		b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error {
+			return &deliveredBatchError{cause: cause}
+		})
+		b.unsent.Store(1)
+		if err := b.sendChunk(context.Background(), []Event{event}); !errors.Is(err, cause) {
+			t.Fatalf("sendChunk = %v, want acknowledgement cause", err)
+		}
+		if counters := b.counters(); counters.Delivered != 1 || counters.Failed != 0 {
+			t.Fatalf("counters = %+v, want one delivered and none failed", counters)
+		}
+		if b.unsent.Load() != 0 {
+			t.Fatalf("unsent = %d, want 0", b.unsent.Load())
+		}
+	})
+}
+
+func TestBatcherRecoveryProgressResolvesCurrentDurableEvents(t *testing.T) {
+	b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error { return nil })
+	b.enqueued.Store(2)
+	b.durableCurrent.Store(2)
+	b.recordRecoveryProgress(2, 0)
+	if counters := b.counters(); counters.Delivered != 2 || counters.Failed != 0 {
+		t.Fatalf("counters = %+v, want two recovered deliveries", counters)
+	}
+	if b.durableCurrent.Load() != 0 {
+		t.Fatalf("durableCurrent = %d, want 0", b.durableCurrent.Load())
 	}
 }
 
@@ -334,6 +495,32 @@ func TestBatcherWholeBatch400SplitsAndDeliversSingles(t *testing.T) {
 	counters := b.counters()
 	if counters.Delivered != 4 || counters.Failed != 0 {
 		t.Fatalf("counters = %+v, want 4 delivered and none failed", counters)
+	}
+}
+
+func TestBatcherWholeBatch400SplitIsBounded(t *testing.T) {
+	sender := &fakeSend{}
+	send := func(ctx context.Context, payload *BatchPayload) error {
+		if err := sender.send(ctx, payload); err != nil {
+			return err
+		}
+		return &terminalStatusError{status: batchRejectStatus}
+	}
+	b := newTestBatcher(100, 100, send)
+	events := make([]Event, 0, 100)
+	for index := 0; index < 100; index++ {
+		events = append(events, testEvent(fmt.Sprintf("event-%d", index)))
+	}
+	b.unsent.Store(int64(len(events)))
+	if err := b.sendChunk(context.Background(), events); err == nil {
+		t.Fatal("bounded split unexpectedly reported success")
+	}
+	if got := len(sender.batches()); got != maxSplitSends {
+		t.Fatalf("split sent %d requests, want cap %d", got, maxSplitSends)
+	}
+	counters := b.counters()
+	if counters.Failed != 100 || b.unsent.Load() != 0 {
+		t.Fatalf("counters = %+v, unsent = %d; want 100 failed and 0 unsent", counters, b.unsent.Load())
 	}
 }
 

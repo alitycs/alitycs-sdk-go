@@ -31,6 +31,25 @@ func samplePayload() *BatchPayload {
 	}
 }
 
+func TestTransportOutcomeErrorsExposeTheirCauses(t *testing.T) {
+	cause := errors.New("outcome cause")
+	errorsWithCause := []error{
+		&durableBatchError{cause: cause},
+		&deliveredBatchError{cause: cause},
+		&retryAfterError{cause: cause},
+		&recoveryOutcomeError{Lost: 2, Blocked: true, Cause: cause},
+	}
+	for _, err := range errorsWithCause {
+		if err.Error() == "" || !errors.Is(err, cause) {
+			t.Fatalf("outcome error %T did not expose its message and cause: %v", err, err)
+		}
+	}
+	deferred := &recoveryDeferredError{untilMS: time.Now().Add(time.Second).UnixMilli()}
+	if !strings.Contains(deferred.Error(), "durable recovery deferred") {
+		t.Fatalf("deferred error = %q", deferred.Error())
+	}
+}
+
 func TestTransportSendsHeadersAndBody(t *testing.T) {
 	var gotAuth, gotContentType, gotMethod, gotPath string
 	var gotBody []byte
@@ -276,7 +295,7 @@ func TestTransportHonoursRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
-func TestTransportCapsRetryAfterAtMaxBackoff(t *testing.T) {
+func TestTransportBoundsServerRetryAfterAboveTheLivenessCeiling(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) == 1 {
@@ -298,8 +317,8 @@ func TestTransportCapsRetryAfterAtMaxBackoff(t *testing.T) {
 	if err := tr.send(context.Background(), samplePayload()); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if len(waits) != 1 || waits[0] != maxBackoff {
-		t.Fatalf("waits = %v, want a single wait capped at %s", waits, maxBackoff)
+	if len(waits) != 1 || waits[0] != maxRetryAfter {
+		t.Fatalf("waits = %v, want the bounded server Retry-After of %s", waits, maxRetryAfter)
 	}
 }
 
@@ -375,8 +394,11 @@ func TestParseRetryAfter(t *testing.T) {
 	if got, ok := parseRetryAfter("120", now); !ok || got != 120*time.Second {
 		t.Errorf("delta-seconds = %s (%v), want 2m0s", got, ok)
 	}
-	if got, ok := parseRetryAfter("-5", now); !ok || got != 0 {
-		t.Errorf("negative delta-seconds = %s, want clamped to zero", got)
+	if got, ok := parseRetryAfter("9223372037", now); !ok || got != time.Duration(1<<63-1) {
+		t.Errorf("oversized delta-seconds = %s (%v), want saturated duration", got, ok)
+	}
+	if _, ok := parseRetryAfter("-5", now); ok {
+		t.Error("negative delta-seconds must be rejected")
 	}
 	past := now.Add(-time.Minute).Format(http.TimeFormat)
 	if got, ok := parseRetryAfter(past, now); !ok || got != 0 {
@@ -385,5 +407,43 @@ func TestParseRetryAfter(t *testing.T) {
 	future := now.Add(90 * time.Second).Format(http.TimeFormat)
 	if got, ok := parseRetryAfter(future, now); !ok || got < 89*time.Second || got > 90*time.Second {
 		t.Errorf("future HTTP-date = %s, want ~90s", got)
+	}
+}
+
+func TestServerRetryAfterIsBoundedDuringSend(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "9223372037")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	transport := newTestTransport(t, server.URL, 1)
+	var waited time.Duration
+	transport.sleep = func(_ context.Context, delay time.Duration) error {
+		waited = delay
+		return nil
+	}
+	if err := transport.send(context.Background(), samplePayload()); err != nil {
+		t.Fatal(err)
+	}
+	if waited != maxRetryAfter {
+		t.Fatalf("waited %s, want bounded Retry-After %s", waited, maxRetryAfter)
+	}
+}
+
+func TestBoundedRetryAfter(t *testing.T) {
+	if got := boundedRetryAfter(-time.Second); got != 0 {
+		t.Fatalf("negative delay bounded to %s, want zero", got)
+	}
+	if got := boundedRetryAfter(30 * time.Second); got != 30*time.Second {
+		t.Fatalf("ordinary delay bounded to %s, want 30s", got)
+	}
+	if got := boundedRetryAfter(time.Hour); got != maxRetryAfter {
+		t.Fatalf("large delay bounded to %s, want %s", got, maxRetryAfter)
 	}
 }

@@ -48,12 +48,17 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
+	store, err := newFileBatchStore(cfg.persistencePath, cfg.maxQueueSize)
+	if err != nil {
+		return nil, err
+	}
 	t := &transport{
 		endpoint:   cfg.endpoint,
 		apiKey:     cfg.apiKey,
 		maxRetries: cfg.maxRetries,
 		client:     cfg.httpClientOrDefault(),
 		debug:      cfg.debug,
+		store:      store,
 	}
 	c := &Client{
 		config:      cfg,
@@ -61,7 +66,8 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		sessions:    newSessionManager(cfg.sessionTimeout),
 		globals:     make(Props),
 	}
-	c.batch = newBatcher(cfg, t.send)
+	c.batch = newBatcher(cfg, t.send, t.persist, t.recover, store.pendingEvents, store.enabled())
+	t.onRecoveryProgress = c.batch.recordRecoveryProgress
 	c.batch.start()
 	return c, nil
 }
@@ -206,15 +212,18 @@ type Stats struct {
 	Failed    int64
 }
 
-// UndeliveredError reports events that had not been confirmed delivered when
-// a shutdown deadline expired.
+// UndeliveredError reports events retained for a later restart or not yet
+// confirmed when a shutdown deadline expired.
 type UndeliveredError struct {
 	Undelivered int
 	Cause       error
 }
 
 func (e *UndeliveredError) Error() string {
-	return fmt.Sprintf("alitycs: shutdown deadline exceeded with %d events not yet delivered: %v", e.Undelivered, e.Cause)
+	if e.Cause == nil {
+		return fmt.Sprintf("alitycs: shutdown left %d events not yet delivered", e.Undelivered)
+	}
+	return fmt.Sprintf("alitycs: shutdown left %d events not yet delivered: %v", e.Undelivered, e.Cause)
 }
 
 func (e *UndeliveredError) Unwrap() error { return e.Cause }
