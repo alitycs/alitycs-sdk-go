@@ -424,15 +424,12 @@ func TestBatcherWholeBatch400SplitIsBounded(t *testing.T) {
 		return &terminalStatusError{status: batchRejectStatus}
 	}
 	b := newTestBatcher(100, 100, send)
-	go b.loop()
-	defer func() { b.stop(); <-b.doneCh }()
-
+	events := make([]Event, 0, 100)
 	for index := 0; index < 100; index++ {
-		if !b.enqueue(testEvent(fmt.Sprintf("event-%d", index)), context.Background()) {
-			t.Fatal("enqueue rejected within budget")
-		}
+		events = append(events, testEvent(fmt.Sprintf("event-%d", index)))
 	}
-	if err := b.flush(context.Background()); err == nil {
+	b.unsent.Store(int64(len(events)))
+	if err := b.sendChunk(context.Background(), events); err == nil {
 		t.Fatal("bounded split unexpectedly reported success")
 	}
 	if got := len(sender.batches()); got != maxSplitSends {

@@ -100,6 +100,9 @@ func (e *recoveryDeferredError) Error() string {
 
 func (t *transport) recover(ctx context.Context) error {
 	for _, record := range t.store.snapshot() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		now := time.Now()
 		deadline := time.UnixMilli(record.PausedUntilMS)
 		maximumDeadline := now.Add(maxRetryAfter)

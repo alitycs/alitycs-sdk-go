@@ -410,6 +410,30 @@ func TestTransportRecoveryCapsAndDefersUntrustedPersistedRetryAfter(t *testing.T
 	}
 }
 
+func TestTransportRecoveryPrefersCallerCancellationToDeferredRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := durableRecord(samplePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.PausedUntilMS = time.Now().Add(time.Minute).UnixMilli()
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+
+	transport := newTestTransport(t, "http://127.0.0.1:1", 0)
+	transport.store = store
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := transport.recover(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("recover error = %v, want context.Canceled", err)
+	}
+}
+
 func TestPersistentTerminalRejectionCountsAsFailedAndLeavesNoWALRecord(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
