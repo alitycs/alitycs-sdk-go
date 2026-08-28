@@ -23,6 +23,9 @@ func TestValidateRestartState(t *testing.T) {
 	if err := validateRestartState("", ""); err != nil {
 		t.Fatalf("ordinary phase unexpectedly requires persistence: %v", err)
 	}
+	if err := validateRestartState("Restart", "/tmp/alitycs-e2e-wal.json"); err == nil {
+		t.Fatal("unknown phase was accepted")
+	}
 }
 
 func TestRunPersistsFailedPhaseAndReplaysOnRestart(t *testing.T) {

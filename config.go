@@ -166,6 +166,9 @@ func WithDebug(debug bool) Option {
 
 // WithPersistence stores serialized in-flight batches at path so a new client
 // process can replay them byte-identically after a crash or lost response.
+// Atomic replacement applies on every target. On darwin, ios, windows, plan9,
+// js, and wasip1, directory sync is unavailable, so an immediate power loss can
+// still lose the latest WAL directory update.
 func WithPersistence(path string) Option {
 	return func(c *config) error {
 		if strings.TrimSpace(path) == "" {

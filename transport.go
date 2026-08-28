@@ -29,7 +29,7 @@ type transport struct {
 	// onRecoveryProgress reports each WAL record resolved during recovery.
 	// The batcher uses it to keep shutdown counts honest while a later record
 	// may still be blocked in the same recovery pass.
-	onRecoveryProgress func(lost int64)
+	onRecoveryProgress func(resolved int64, lost int64)
 
 	// backoff overrides the retry schedule; tests use it to avoid real
 	// sleeps. nil means the production schedule.
@@ -53,10 +53,17 @@ func (t *transport) send(ctx context.Context, payload *BatchPayload) error {
 		return err
 	}
 	if err := t.store.put(record); err != nil {
+		if persistenceMutationCommitted(err) {
+			return &durableBatchError{cause: err}
+		}
 		return err
 	}
 	err = t.sendRecord(ctx, record)
 	if err != nil && t.store.enabled() {
+		var delivered *deliveredBatchError
+		if errors.As(err, &delivered) {
+			return err
+		}
 		var terminal *terminalStatusError
 		if !errors.As(err, &terminal) {
 			return &durableBatchError{cause: err}
@@ -70,7 +77,11 @@ func (t *transport) persist(payload *BatchPayload) error {
 	if err != nil {
 		return err
 	}
-	return t.store.put(record)
+	err = t.store.put(record)
+	if err != nil && persistenceMutationCommitted(err) {
+		return &durableBatchError{cause: err}
+	}
+	return err
 }
 
 func durableRecord(payload *BatchPayload) (durableBatchRecord, error) {
@@ -88,6 +99,13 @@ type durableBatchError struct{ cause error }
 
 func (e *durableBatchError) Error() string { return e.cause.Error() }
 func (e *durableBatchError) Unwrap() error { return e.cause }
+
+// deliveredBatchError reports a post-delivery durability warning while proving
+// the endpoint accepted the batch and the WAL removal crossed its commit point.
+type deliveredBatchError struct{ cause error }
+
+func (e *deliveredBatchError) Error() string { return e.cause.Error() }
+func (e *deliveredBatchError) Unwrap() error { return e.cause }
 
 type retryAfterError struct {
 	cause   error
@@ -155,6 +173,13 @@ func (t *transport) recover(ctx context.Context) error {
 			return t.recoveryResult(lost, true, &recoveryDeferredError{untilMS: record.PausedUntilMS})
 		}
 		if err := t.sendRecord(ctx, record); err != nil {
+			var delivered *deliveredBatchError
+			if errors.As(err, &delivered) {
+				if t.onRecoveryProgress != nil {
+					t.onRecoveryProgress(int64(record.EventCount), 0)
+				}
+				return t.recoveryResult(lost, true, err)
+			}
 			var terminal *terminalStatusError
 			if errors.As(err, &terminal) {
 				lost += int64(record.EventCount)
@@ -162,14 +187,14 @@ func (t *transport) recover(ctx context.Context) error {
 				warnLog("recovered batch %s rejected permanently (HTTP %d) — discarding %d persisted events",
 					record.BatchID, terminal.status, record.EventCount)
 				if t.onRecoveryProgress != nil {
-					t.onRecoveryProgress(int64(record.EventCount))
+					t.onRecoveryProgress(int64(record.EventCount), int64(record.EventCount))
 				}
 				continue
 			}
 			return t.recoveryResult(lost, true, err)
 		}
 		if t.onRecoveryProgress != nil {
-			t.onRecoveryProgress(0)
+			t.onRecoveryProgress(int64(record.EventCount), 0)
 		}
 	}
 	return t.recoveryResult(lost, false, lastTerminal)
@@ -200,7 +225,12 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 		suggested, suggestedOK, err := t.post(ctx, body)
 		if err == nil {
 			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
-				warnLog("batch %s was accepted but its WAL acknowledgement failed (%v) — replay may occur after restart",
+				if persistenceMutationCommitted(storeErr) {
+					warnLog("batch %s was accepted and removed from the WAL, but the directory sync failed: %v",
+						record.BatchID, storeErr)
+					return &deliveredBatchError{cause: storeErr}
+				}
+				warnLog("batch %s was accepted but could not be removed from the WAL (%v) — replay may occur after restart",
 					record.BatchID, storeErr)
 				return storeErr
 			}
@@ -210,6 +240,13 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 		retryAfter, hasRetryAfter = boundedRetryAfter(suggested), suggestedOK
 		if errors.Is(err, errTerminalStatus) {
 			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
+				if persistenceMutationCommitted(storeErr) {
+					warnLog("batch %s rejection was removed from the WAL, but the directory sync failed: %v",
+						record.BatchID, storeErr)
+					return errors.Join(err, storeErr)
+				}
+				warnLog("batch %s was rejected but could not be removed from the WAL (%v) — it remains pending",
+					record.BatchID, storeErr)
 				return storeErr
 			}
 			t.debugf("%v — not retrying", err)

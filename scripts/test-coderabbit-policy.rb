@@ -111,6 +111,17 @@ create_run = create_step.is_a?(Hash) ? create_step["run"].to_s : ""
 verify_lines = shell_lines.call(verify_run)
 recheck_lines = shell_lines.call(recheck_run)
 create_lines = shell_lines.call(create_run)
+release_creation_reference = lambda do |step|
+  run = step.is_a?(Hash) ? step["run"] : nil
+  run.is_a?(String) && shell_lines.call(run).any? { |line| line.match?(/\bgh\s+release\s+create\b/) }
+end
+unique_release_creation_step = lambda do |steps, expected_step|
+  next false unless steps.is_a?(Array) && expected_step
+
+  creation_indexes = steps.each_index.select { |index| release_creation_reference.call(steps[index]) }
+  expected_index = steps.index(expected_step)
+  creation_indexes.length == 1 && creation_indexes.first == expected_index
+end
 tag_guard = 'if [[ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]]; then'
 guard_start = verify_lines.index(tag_guard)
 guard_end = guard_start && verify_lines.each_index.find { |index| index > guard_start && verify_lines[index] == "fi" }
@@ -135,6 +146,14 @@ end
 release_command = 'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes'
 release_created_after_recheck = lambda do |lines|
   lines == tag_identity_sequence + [release_command]
+end
+unless unique_release_creation_step.call(release_steps, create_step)
+  failures << "release creation must occur in exactly one reviewed step"
+end
+early_release_step = { "name" => "Publish early", "run" => release_command }
+fixture_steps = [early_release_step, create_step].compact
+if create_step && unique_release_creation_step.call(fixture_steps, create_step)
+  failures << "release creation in an earlier step must not count"
 end
 identity_checks_without_fetch = tag_identity_sequence.drop(1)
 failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)

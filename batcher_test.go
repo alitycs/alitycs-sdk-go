@@ -273,6 +273,57 @@ func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	}
 }
 
+func TestBatcherClassifiesCommittedPersistenceOutcomes(t *testing.T) {
+	event := testEvent("committed")
+
+	t.Run("retained put", func(t *testing.T) {
+		cause := errors.New("post-commit put sync failed")
+		b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error {
+			return &durableBatchError{cause: cause}
+		})
+		b.unsent.Store(1)
+		if err := b.sendChunk(context.Background(), []Event{event}); !errors.Is(err, cause) {
+			t.Fatalf("sendChunk = %v, want retained cause", err)
+		}
+		if counters := b.counters(); counters.Delivered != 0 || counters.Failed != 0 {
+			t.Fatalf("counters = %+v, want retained without delivery or loss", counters)
+		}
+		if b.durableCurrent.Load() != 1 || b.unsent.Load() != 0 {
+			t.Fatalf("durableCurrent = %d, unsent = %d; want 1, 0", b.durableCurrent.Load(), b.unsent.Load())
+		}
+	})
+
+	t.Run("delivered acknowledgement", func(t *testing.T) {
+		cause := errors.New("post-commit acknowledgement sync failed")
+		b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error {
+			return &deliveredBatchError{cause: cause}
+		})
+		b.unsent.Store(1)
+		if err := b.sendChunk(context.Background(), []Event{event}); !errors.Is(err, cause) {
+			t.Fatalf("sendChunk = %v, want acknowledgement cause", err)
+		}
+		if counters := b.counters(); counters.Delivered != 1 || counters.Failed != 0 {
+			t.Fatalf("counters = %+v, want one delivered and none failed", counters)
+		}
+		if b.unsent.Load() != 0 {
+			t.Fatalf("unsent = %d, want 0", b.unsent.Load())
+		}
+	})
+}
+
+func TestBatcherRecoveryProgressResolvesCurrentDurableEvents(t *testing.T) {
+	b := newTestBatcher(1, 10, func(context.Context, *BatchPayload) error { return nil })
+	b.enqueued.Store(2)
+	b.durableCurrent.Store(2)
+	b.recordRecoveryProgress(2, 0)
+	if counters := b.counters(); counters.Delivered != 2 || counters.Failed != 0 {
+		t.Fatalf("counters = %+v, want two recovered deliveries", counters)
+	}
+	if b.durableCurrent.Load() != 0 {
+		t.Fatalf("durableCurrent = %d, want 0", b.durableCurrent.Load())
+	}
+}
+
 func TestBatcherWaitDoneReportsResult(t *testing.T) {
 	sender := &fakeSend{err: errors.New("endpoint down")}
 	b := newTestBatcher(2, 100, sender.send)

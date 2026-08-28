@@ -87,6 +87,7 @@ type batcher struct {
 	// restart-owned events without double-counting either group.
 	recoveryOwned  atomic.Int64
 	recoveryFailed atomic.Int64
+	durableCurrent atomic.Int64
 
 	pending   []Event // owned by the loop goroutine only
 	lastCause error   // most recent send failure; read only after doneCh closes
@@ -133,7 +134,8 @@ func (b *batcher) enqueue(event Event, ctx context.Context) bool {
 	}
 	for {
 		current := b.unsent.Load()
-		if current+int64(b.durablePending()) >= int64(b.queueLimit) {
+		uniquePending := current + b.recoveryOwned.Load() + b.durableCurrent.Load()
+		if uniquePending >= int64(b.queueLimit) {
 			b.dropped.Add(1)
 			debugLog(b.debug, "queue full (%d) — dropping event %s", b.queueLimit, event.EventID)
 			return false
@@ -316,7 +318,12 @@ func (b *batcher) finish(ctx context.Context) {
 		chunk := b.pending[:size]
 		b.pending = b.pending[size:]
 		if err := b.sendChunk(ctx, chunk); err != nil {
-			debugLog(b.debug, "shutdown lost %d events: %v", len(chunk), err)
+			var delivered *deliveredBatchError
+			if errors.As(err, &delivered) {
+				debugLog(b.debug, "shutdown delivered %d events with a WAL sync warning: %v", len(chunk), err)
+			} else {
+				debugLog(b.debug, "shutdown lost %d events: %v", len(chunk), err)
+			}
 		}
 	}
 }
@@ -343,11 +350,16 @@ func (b *batcher) persistPending() {
 			err = b.persist(payload)
 		}
 		b.unsent.Add(-int64(len(chunk)))
-		if err != nil {
+		var retained *durableBatchError
+		if err != nil && !errors.As(err, &retained) {
 			b.failed.Add(int64(len(chunk)))
 			b.lastCause = err
 			warnLog("shutdown could not persist %d accepted events: %v", len(chunk), err)
 			continue
+		}
+		b.durableCurrent.Add(int64(len(chunk)))
+		if err != nil {
+			b.lastCause = err
 		}
 		debugLog(b.debug, "shutdown retained %d accepted events for restart", len(chunk))
 	}
@@ -414,10 +426,19 @@ func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocke
 	return nil, err
 }
 
-func (b *batcher) recordRecoveryProgress(lost int64) {
+func (b *batcher) recordRecoveryProgress(resolved int64, lost int64) {
+	initial := b.recoveryOwned.Load() > 0
 	if lost > 0 {
 		b.failed.Add(lost)
-		b.recoveryFailed.Add(lost)
+		if initial {
+			b.recoveryFailed.Add(lost)
+		}
+	}
+	if !initial && resolved > 0 {
+		b.durableCurrent.Add(-resolved)
+		if lost == 0 {
+			b.delivered.Add(resolved)
+		}
 	}
 	b.updateRecoveryOwned()
 }
@@ -481,6 +502,13 @@ func (b *batcher) deliver(ctx context.Context, events []Event, remainingSends *i
 		b.delivered.Add(int64(len(events)))
 		return nil
 	}
+	var delivered *deliveredBatchError
+	if errors.As(err, &delivered) {
+		b.unsent.Add(-int64(len(events)))
+		b.delivered.Add(int64(len(events)))
+		b.lastCause = err
+		return err
+	}
 
 	var terminal *terminalStatusError
 	if errors.As(err, &terminal) && terminal.status == batchRejectStatus &&
@@ -498,7 +526,9 @@ func (b *batcher) deliver(ctx context.Context, events []Event, remainingSends *i
 
 	b.unsent.Add(-int64(len(events)))
 	var retained *durableBatchError
-	if !errors.As(err, &retained) {
+	if errors.As(err, &retained) {
+		b.durableCurrent.Add(int64(len(events)))
+	} else {
 		b.failed.Add(int64(len(events)))
 	}
 	b.lastCause = err

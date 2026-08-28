@@ -90,6 +90,26 @@ func TestFileBatchStoreRejectsInvalidSerializedBodies(t *testing.T) {
 	}
 }
 
+func TestFileBatchStoreRejectsInvalidPutBeforeWriting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.put(durableBatchRecord{
+		BatchID: "batch_outer", Body: `{"batchId":"batch_inner","events":[{}]}`, EventCount: 1,
+	})
+	if err == nil {
+		t.Fatal("put accepted a body that does not match its outer record")
+	}
+	if store.pendingEvents() != 0 {
+		t.Fatalf("invalid put left %d pending events", store.pendingEvents())
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("invalid put created a WAL: %v", err)
+	}
+}
+
 func TestSyncDirectoryReportsSupportedOpenFailure(t *testing.T) {
 	err := syncDirectory(filepath.Join(t.TempDir(), "missing"))
 	switch runtime.GOOS {
@@ -248,6 +268,137 @@ func TestFileBatchStoreKeepsCommittedMemoryAfterDirectorySyncFailure(t *testing.
 			t.Fatalf("committed acknowledge not retained on disk: %#v, pending = %d", got, restarted.pendingEvents())
 		}
 	})
+}
+
+func TestTransportClassifiesCommittedPersistenceErrors(t *testing.T) {
+	syncFailure := errors.New("directory sync failed")
+
+	t.Run("put remains retained", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		defer server.Close()
+		store, err := newFileBatchStore(filepath.Join(t.TempDir(), "wal.json"), defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+		transport := newTestTransport(t, server.URL, 0)
+		transport.store = store
+
+		err = transport.send(context.Background(), samplePayload())
+		var retained *durableBatchError
+		if !errors.As(err, &retained) || store.pendingEvents() != 1 {
+			t.Fatalf("send = %v, pending = %d; want retained committed put", err, store.pendingEvents())
+		}
+		if requests.Load() != 0 {
+			t.Fatalf("committed put sync failure made %d network requests, want 0", requests.Load())
+		}
+	})
+
+	t.Run("persist-only put remains retained", func(t *testing.T) {
+		store, err := newFileBatchStore(filepath.Join(t.TempDir(), "wal.json"), defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+		transport := newTestTransport(t, "http://127.0.0.1:1", 0)
+		transport.store = store
+
+		err = transport.persist(samplePayload())
+		var retained *durableBatchError
+		if !errors.As(err, &retained) || store.pendingEvents() != 1 {
+			t.Fatalf("persist = %v, pending = %d; want retained committed put", err, store.pendingEvents())
+		}
+	})
+
+	t.Run("acknowledgement remains delivered", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		defer server.Close()
+		path := filepath.Join(t.TempDir(), "wal.json")
+		store, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := samplePayload()
+		record, err := durableRecord(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.put(record); err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+		transport := newTestTransport(t, server.URL, 0)
+		transport.store = store
+
+		err = transport.send(context.Background(), payload)
+		var delivered *deliveredBatchError
+		if !errors.As(err, &delivered) || store.pendingEvents() != 0 {
+			t.Fatalf("send = %v, pending = %d; want delivered committed acknowledgement", err, store.pendingEvents())
+		}
+		if requests.Load() != 1 {
+			t.Fatalf("requests = %d, want 1", requests.Load())
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("committed acknowledgement left WAL behind: %v", err)
+		}
+	})
+}
+
+func TestDurableAdmissionCountsUniqueInflightEvents(t *testing.T) {
+	var requests atomic.Int32
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			close(started)
+			<-unblock
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(unblock)
+		}
+	}()
+	client, err := New(
+		"pk_test",
+		WithEndpoint(server.URL),
+		WithFlushSize(1),
+		WithFlushInterval(0),
+		WithMaxQueueSize(2),
+		WithMaxRetries(0),
+		WithPersistence(filepath.Join(t.TempDir(), "wal.json")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Track(context.Background(), "first", nil)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first durable send did not reach the endpoint")
+	}
+	client.Track(context.Background(), "second", nil)
+	client.Track(context.Background(), "third", nil)
+	stats := client.Stats()
+	if stats.Enqueued != 2 || stats.Dropped != 1 {
+		t.Fatalf("Stats = %+v, want two unique events admitted and the third dropped", stats)
+	}
+	close(unblock)
+	released = true
+	if err := client.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
 }
 
 func TestFileBatchStoreSyncsNewDirectoryParents(t *testing.T) {
@@ -562,7 +713,7 @@ func TestShutdownDeadlineIncludesRecoveredWALRecords(t *testing.T) {
 	shutdownErr := client.Shutdown(ctx)
 	select {
 	case <-started:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("shutdown deadline elapsed before recovery reached the endpoint")
 	}
 	var undelivered *UndeliveredError
@@ -628,7 +779,7 @@ func TestShutdownDeadlineReportsRecoveredLossBeforeBlockedRecord(t *testing.T) {
 	shutdownErr := client.Shutdown(ctx)
 	select {
 	case <-blocked:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("shutdown deadline elapsed before recovery reached the blocked record")
 	}
 	var undelivered *UndeliveredError

@@ -109,6 +109,11 @@ func requiredEnvironment(name string) string {
 }
 
 func validateRestartState(phase, stateFile string) error {
+	switch phase {
+	case "", "first", "restart":
+	default:
+		return fmt.Errorf("unknown ALITYCS_E2E_PHASE %q", phase)
+	}
 	if (phase == "first" || phase == "restart") && stateFile == "" {
 		return fmt.Errorf("ALITYCS_STATE_FILE is required for %s phase", phase)
 	}

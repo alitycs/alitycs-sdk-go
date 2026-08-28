@@ -39,13 +39,15 @@ here before a version tag is created.
   with flushSize > maxQueueSize the queue budget filled first, so the size trigger could never
   fire and batches only left via the timer or explicit Flush/Shutdown. Equal values remain legal.
 - WAL growth is capped by `maxQueueSize`; persisted state above the configured cap fails startup,
-  serialized bodies are validated against their outer batch ID and event count, and failed
+  serialized bodies are validated against their outer batch ID and event count at load and write
+  boundaries, and failed
   pre-commit mutations roll back their in-memory state while post-commit sync failures retain the
-  disk-equivalent state. File contents are fsynced before replace, followed by required fsyncs for
-  the WAL directory and every newly created parent on supported platforms.
+  disk-equivalent state and report retained puts or delivered acknowledgements accordingly. File
+  contents are fsynced before replace, followed by required fsyncs for the WAL directory and every
+  newly created parent on supported platforms.
 - HTTP 400 isolation is capped at 64 sends, preventing a large rejected batch from amplifying into
   an unbounded request storm. Concurrent admission now reserves queue capacity atomically and
-  includes retained durable events in the budget.
+  includes retained durable events in the budget without counting their in-flight WAL mirror twice.
 - Terminal rejections of persisted single events now count in `Stats().Failed` and
   `LostEventsError` after their WAL records are removed, including rejections observed only during
   restart recovery; `Flush` also reports that recovery loss. Shutdown reports any accepted events

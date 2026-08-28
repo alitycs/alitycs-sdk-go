@@ -23,6 +23,28 @@ type durableBatchState struct {
 	Batches []durableBatchRecord `json:"batches"`
 }
 
+// persistenceMutationError distinguishes failures before and after the atomic
+// filesystem commit point so callers can report the state that actually won.
+type persistenceMutationError struct {
+	committed bool
+	cause     error
+}
+
+func (e *persistenceMutationError) Error() string { return e.cause.Error() }
+func (e *persistenceMutationError) Unwrap() error { return e.cause }
+
+func persistenceMutationCommitted(err error) bool {
+	var mutation *persistenceMutationError
+	return errors.As(err, &mutation) && mutation.committed
+}
+
+func persistenceMutationResult(committed bool, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &persistenceMutationError{committed: committed, cause: err}
+}
+
 // fileBatchStore atomically snapshots serialized batches awaiting a terminal outcome.
 type fileBatchStore struct {
 	mu               sync.Mutex
@@ -104,6 +126,9 @@ func (s *fileBatchStore) put(record durableBatchRecord) error {
 		}
 		return fmt.Errorf("alitycs: persistence batch id collision %q", record.BatchID)
 	}
+	if err := validateDurableRecord(record); err != nil {
+		return err
+	}
 	if record.EventCount < 1 || s.pending.Load()+int64(record.EventCount) > int64(s.maxPendingEvents) {
 		return fmt.Errorf("alitycs: persistence event limit exceeded (%d)", s.maxPendingEvents)
 	}
@@ -116,7 +141,7 @@ func (s *fileBatchStore) put(record durableBatchRecord) error {
 		s.order = s.order[:len(s.order)-1]
 		s.pending.Add(-int64(record.EventCount))
 	}
-	return err
+	return persistenceMutationResult(committed, err)
 }
 
 func (s *fileBatchStore) acknowledge(batchID string) error {
@@ -149,7 +174,7 @@ func (s *fileBatchStore) acknowledge(batchID string) error {
 		}
 		s.pending.Add(int64(record.EventCount))
 	}
-	return err
+	return persistenceMutationResult(committed, err)
 }
 
 func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
@@ -169,7 +194,7 @@ func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
 	if err != nil && !committed {
 		s.records[batchID] = previous
 	}
-	return err
+	return persistenceMutationResult(committed, err)
 }
 
 func (s *fileBatchStore) snapshot() []durableBatchRecord {

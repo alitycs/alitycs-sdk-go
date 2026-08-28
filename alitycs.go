@@ -220,6 +220,9 @@ type UndeliveredError struct {
 }
 
 func (e *UndeliveredError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("alitycs: shutdown left %d events not yet delivered", e.Undelivered)
+	}
 	return fmt.Sprintf("alitycs: shutdown left %d events not yet delivered: %v", e.Undelivered, e.Cause)
 }
 

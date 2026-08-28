@@ -31,6 +31,25 @@ func samplePayload() *BatchPayload {
 	}
 }
 
+func TestTransportOutcomeErrorsExposeTheirCauses(t *testing.T) {
+	cause := errors.New("outcome cause")
+	errorsWithCause := []error{
+		&durableBatchError{cause: cause},
+		&deliveredBatchError{cause: cause},
+		&retryAfterError{cause: cause},
+		&recoveryOutcomeError{Lost: 2, Blocked: true, Cause: cause},
+	}
+	for _, err := range errorsWithCause {
+		if err.Error() == "" || !errors.Is(err, cause) {
+			t.Fatalf("outcome error %T did not expose its message and cause: %v", err, err)
+		}
+	}
+	deferred := &recoveryDeferredError{untilMS: time.Now().Add(time.Second).UnixMilli()}
+	if !strings.Contains(deferred.Error(), "durable recovery deferred") {
+		t.Fatalf("deferred error = %q", deferred.Error())
+	}
+}
+
 func TestTransportSendsHeadersAndBody(t *testing.T) {
 	var gotAuth, gotContentType, gotMethod, gotPath string
 	var gotBody []byte

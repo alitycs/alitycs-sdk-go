@@ -600,6 +600,13 @@ func TestShutdownDeadlineReportsUndelivered(t *testing.T) {
 	waitForRequests(t, capture, 1)
 }
 
+func TestUndeliveredErrorOmitsNilCause(t *testing.T) {
+	err := (&UndeliveredError{Undelivered: 2}).Error()
+	if strings.Contains(err, "<nil>") || !strings.Contains(err, "2 events not yet delivered") {
+		t.Fatalf("UndeliveredError = %q", err)
+	}
+}
+
 // TestConcurrentUseIsRaceFree exercises interleaved Track/Flush/Shutdown from
 // many goroutines; run under -race this is the concurrency regression gate.
 func TestConcurrentUseIsRaceFree(t *testing.T) {
