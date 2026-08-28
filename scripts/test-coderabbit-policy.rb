@@ -133,14 +133,8 @@ tag_identity_rechecked = lambda do |lines|
   lines.each_cons(tag_identity_sequence.length).any? { |sequence| sequence == tag_identity_sequence }
 end
 release_command = 'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes'
-release_invocation = /\A(?:command\s+|exec\s+)?#{Regexp.escape(release_command)}\z/
 release_created_after_recheck = lambda do |lines|
-  release_indexes = lines.each_index.select { |index| lines[index].match?(release_invocation) }
-  next false unless release_indexes.length == 1
-
-  release_index = release_indexes.first
-  release_index >= tag_identity_sequence.length &&
-    lines[(release_index - tag_identity_sequence.length)...release_index] == tag_identity_sequence
+  lines == tag_identity_sequence + [release_command]
 end
 identity_checks_without_fetch = tag_identity_sequence.drop(1)
 failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
@@ -150,6 +144,14 @@ duplicate_creation = [release_command] + tag_identity_sequence + [release_comman
 failures << "early release creation must not count" if release_created_after_recheck.call(duplicate_creation)
 prefixed_creation = ["command #{release_command}"] + tag_identity_sequence + [release_command]
 failures << "prefixed release creation must not count" if release_created_after_recheck.call(prefixed_creation)
+[
+  "#{release_command} # publish",
+  "env #{release_command}",
+  "GH_TOKEN=token #{release_command}",
+].each do |unapproved_invocation|
+  fixture = [unapproved_invocation] + tag_identity_sequence + [release_command]
+  failures << "unapproved release creation must not count" if release_created_after_recheck.call(fixture)
+end
 unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
 end
