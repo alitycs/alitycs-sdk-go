@@ -5,6 +5,14 @@ here before a version tag is created.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
+### Added
+- Optional `WithPersistence(path)` exact-batch write-ahead logging. A serialized in-flight batch
+  is stored atomically before its first attempt and replayed byte-identically after restart,
+  including any remaining final `Retry-After` deadline. Terminal responses acknowledge the WAL;
+  pre-flush in-memory events remain outside this durability boundary.
+
 ### Changed
 - Retry backoff is now jittered ±20% so many clients retrying after a shared failure do not hit
   the ingest endpoint in lockstep. The overall schedule is unchanged: 1s doubling to a 10s cap.
@@ -28,3 +36,6 @@ here before a version tag is created.
 - New now rejects a flush size above the max queue size instead of accepting the configuration:
   with flushSize > maxQueueSize the queue budget filled first, so the size trigger could never
   fire and batches only left via the timer or explicit Flush/Shutdown. Equal values remain legal.
+
+[Unreleased]: https://github.com/alitycs/alitycs-sdk-go/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alitycs/alitycs-sdk-go/releases/tag/v1.0.0
