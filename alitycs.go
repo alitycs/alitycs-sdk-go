@@ -48,7 +48,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	store, err := newFileBatchStore(cfg.persistencePath)
+	store, err := newFileBatchStore(cfg.persistencePath, cfg.maxQueueSize)
 	if err != nil {
 		return nil, err
 	}

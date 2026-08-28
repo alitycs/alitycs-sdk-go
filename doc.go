@@ -57,8 +57,11 @@
 // attempt; an exhausted transient failure remains for the next process to
 // replay during Flush or Shutdown, including any remaining Retry-After pause.
 // Terminal responses acknowledge and remove it. The WAL does not cover events
-// still waiting in the in-memory pre-flush queue, and one client process must
-// own a given path.
+// still waiting in the in-memory pre-flush queue, is capped at maxQueueSize
+// retained events, and one client process must own a given path. SDK-generated
+// exponential backoff is capped at 10 seconds; an explicit server Retry-After
+// deadline is authoritative and is not shortened to that cap. HTTP 400 split
+// isolation is bounded to 64 sends per original batch.
 //
 // # Contexts
 //

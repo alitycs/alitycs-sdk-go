@@ -276,7 +276,7 @@ func TestTransportHonoursRetryAfterHTTPDate(t *testing.T) {
 	}
 }
 
-func TestTransportCapsRetryAfterAtMaxBackoff(t *testing.T) {
+func TestTransportDoesNotShortenRetryAfterToMaxBackoff(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) == 1 {
@@ -298,8 +298,8 @@ func TestTransportCapsRetryAfterAtMaxBackoff(t *testing.T) {
 	if err := tr.send(context.Background(), samplePayload()); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if len(waits) != 1 || waits[0] != maxBackoff {
-		t.Fatalf("waits = %v, want a single wait capped at %s", waits, maxBackoff)
+	if len(waits) != 1 || waits[0] != time.Hour {
+		t.Fatalf("waits = %v, want the full server Retry-After of 1h", waits)
 	}
 }
 
@@ -375,8 +375,8 @@ func TestParseRetryAfter(t *testing.T) {
 	if got, ok := parseRetryAfter("120", now); !ok || got != 120*time.Second {
 		t.Errorf("delta-seconds = %s (%v), want 2m0s", got, ok)
 	}
-	if got, ok := parseRetryAfter("-5", now); !ok || got != 0 {
-		t.Errorf("negative delta-seconds = %s, want clamped to zero", got)
+	if _, ok := parseRetryAfter("-5", now); ok {
+		t.Error("negative delta-seconds must be rejected")
 	}
 	past := now.Add(-time.Minute).Format(http.TimeFormat)
 	if got, ok := parseRetryAfter(past, now); !ok || got != 0 {

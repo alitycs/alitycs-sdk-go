@@ -30,12 +30,18 @@ here before a version tag is created.
 
 ### Fixed
 - A 429 response's `Retry-After` header (delta-seconds or HTTP-date) is now honoured: the retry
-  after it waits at least that long instead of the default backoff, still capped at 10s.
-  Previously the header was ignored and rate-limited clients hammered through the rate limit.
+  after it waits at least that long instead of the default backoff. Only SDK-generated exponential
+  backoff is capped at 10s; server deadlines are not shortened.
   The redelivered batch stays byte-identical — only the timing changes.
 - New now rejects a flush size above the max queue size instead of accepting the configuration:
   with flushSize > maxQueueSize the queue budget filled first, so the size trigger could never
   fire and batches only left via the timer or explicit Flush/Shutdown. Equal values remain legal.
+- WAL growth is capped by `maxQueueSize`; persisted state above the configured cap fails startup,
+  and failed mutations roll back their in-memory state. File contents are fsynced before replace,
+  followed by a best-effort directory fsync.
+- HTTP 400 isolation is capped at 64 sends, preventing a large rejected batch from amplifying into
+  an unbounded request storm. Concurrent admission now reserves queue capacity atomically and
+  includes retained durable events in the budget.
 
 [Unreleased]: https://github.com/alitycs/alitycs-sdk-go/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/alitycs/alitycs-sdk-go/releases/tag/v1.0.0

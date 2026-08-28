@@ -119,17 +119,23 @@ func (b *batcher) enqueue(event Event, ctx context.Context) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if b.unsent.Load() >= int64(b.queueLimit) {
-		b.dropped.Add(1)
-		debugLog(b.debug, "queue full (%d) — dropping event %s", b.queueLimit, event.EventID)
-		return false
+	for {
+		current := b.unsent.Load()
+		if current+int64(b.durablePending()) >= int64(b.queueLimit) {
+			b.dropped.Add(1)
+			debugLog(b.debug, "queue full (%d) — dropping event %s", b.queueLimit, event.EventID)
+			return false
+		}
+		if b.unsent.CompareAndSwap(current, current+1) {
+			break
+		}
 	}
 	select {
 	case b.events <- inbound{event: event, ctx: ctx}:
 		b.enqueued.Add(1)
-		b.unsent.Add(1)
 		return true
 	default:
+		b.unsent.Add(-1)
 		b.dropped.Add(1)
 		debugLog(b.debug, "queue channel full — dropping event %s", event.EventID)
 		return false
@@ -329,9 +335,9 @@ func (b *batcher) sendPending(ctx context.Context) error {
 	return firstErr
 }
 
-// maxSplitDepth bounds the recursion of whole-batch rejection splitting; deep
-// enough for ~2^32 events, far beyond any queue limit.
-const maxSplitDepth = 32
+// maxSplitSends bounds whole-batch rejection isolation so one response cannot
+// amplify into an unbounded request storm under a very large flush size.
+const maxSplitSends = 64
 
 // batchRejectStatus is the HTTP status the ingest endpoint answers with when it
 // rejects an entire batch over a single invalid event.
@@ -339,7 +345,8 @@ const batchRejectStatus = http.StatusBadRequest
 
 // sendChunk sends one payload and resolves its fate.
 func (b *batcher) sendChunk(ctx context.Context, events []Event) error {
-	return b.deliver(ctx, events, 0)
+	remainingSends := maxSplitSends
+	return b.deliver(ctx, events, &remainingSends)
 }
 
 // deliver sends one payload and resolves its fate. On an HTTP 400 the server
@@ -347,7 +354,16 @@ func (b *batcher) sendChunk(ctx context.Context, events []Event) error {
 // chunk is split in half and each half retried recursively until only valid
 // singles remain. Any other failure counts the chunk as lost: retries already
 // ran inside send, and re-queueing a refused event would poison future batches.
-func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error {
+func (b *batcher) deliver(ctx context.Context, events []Event, remainingSends *int) error {
+	if *remainingSends <= 0 {
+		err := errors.New("alitycs: batch rejection split limit reached")
+		b.unsent.Add(-int64(len(events)))
+		b.failed.Add(int64(len(events)))
+		b.lastCause = err
+		warnLog("batch rejection split limit reached — dropping %d unresolved events", len(events))
+		return err
+	}
+	(*remainingSends)--
 	payload := &BatchPayload{
 		BatchID: prefixBatch + generateID(),
 		SentAt:  nowMillis(),
@@ -362,12 +378,12 @@ func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error 
 
 	var terminal *terminalStatusError
 	if errors.As(err, &terminal) && terminal.status == batchRejectStatus &&
-		len(events) > 1 && depth < maxSplitDepth {
+		len(events) > 1 {
 		warnLog("batch %s rejected whole (HTTP %d) — splitting %d events in half and retrying",
 			payload.BatchID, terminal.status, len(events))
 		mid := len(events) / 2
-		leftErr := b.deliver(ctx, events[:mid], depth+1)
-		rightErr := b.deliver(ctx, events[mid:], depth+1)
+		leftErr := b.deliver(ctx, events[:mid], remainingSends)
+		rightErr := b.deliver(ctx, events[mid:], remainingSends)
 		if leftErr != nil {
 			return leftErr
 		}

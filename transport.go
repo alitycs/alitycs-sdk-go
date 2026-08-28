@@ -105,7 +105,7 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 		if attempt > 0 {
 			delay := t.delayFor(attempt)
 			if hasRetryAfter {
-				delay = min(retryAfter, maxBackoff)
+				delay = retryAfter
 			}
 			hasRetryAfter = false
 			t.debugf("attempt %d failed (%v), retrying…", attempt, lastErr)
@@ -203,9 +203,10 @@ func parseRetryAfter(value string, now time.Time) (d time.Duration, ok bool) {
 	if value == "" {
 		return 0, false
 	}
-	if seconds, err := strconv.Atoi(value); err == nil {
-		if seconds < 0 {
-			seconds = 0
+	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
+		const maxDurationSeconds = uint64((1<<63 - 1) / int64(time.Second))
+		if seconds > maxDurationSeconds {
+			return time.Duration(1<<63 - 1), true
 		}
 		return time.Duration(seconds) * time.Second, true
 	}

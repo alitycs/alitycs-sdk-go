@@ -2,10 +2,12 @@ package alitycs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 type durableBatchRecord struct {
@@ -22,14 +24,21 @@ type durableBatchState struct {
 
 // fileBatchStore atomically snapshots serialized batches awaiting a terminal outcome.
 type fileBatchStore struct {
-	mu      sync.Mutex
-	path    string
-	records map[string]durableBatchRecord
-	order   []string
+	mu               sync.Mutex
+	path             string
+	maxPendingEvents int
+	pending          atomic.Int64
+	records          map[string]durableBatchRecord
+	order            []string
 }
 
-func newFileBatchStore(path string) (*fileBatchStore, error) {
-	store := &fileBatchStore{path: path, records: make(map[string]durableBatchRecord)}
+func newFileBatchStore(path string, maxPendingEvents int) (*fileBatchStore, error) {
+	if maxPendingEvents < 1 {
+		return nil, errors.New("alitycs: persistence event limit must be positive")
+	}
+	store := &fileBatchStore{
+		path: path, maxPendingEvents: maxPendingEvents, records: make(map[string]durableBatchRecord),
+	}
 	if path == "" {
 		return store, nil
 	}
@@ -45,10 +54,18 @@ func newFileBatchStore(path string) (*fileBatchStore, error) {
 		return nil, fmt.Errorf("alitycs: invalid persistence file %q", path)
 	}
 	for _, record := range state.Batches {
-		if _, exists := store.records[record.BatchID]; !exists {
-			store.order = append(store.order, record.BatchID)
+		if record.BatchID == "" || record.EventCount < 1 {
+			return nil, fmt.Errorf("alitycs: invalid persistence record in %q", path)
 		}
+		if _, exists := store.records[record.BatchID]; exists {
+			return nil, fmt.Errorf("alitycs: duplicate persistence batch %q", record.BatchID)
+		}
+		store.order = append(store.order, record.BatchID)
 		store.records[record.BatchID] = record
+		pending := store.pending.Add(int64(record.EventCount))
+		if pending > int64(store.maxPendingEvents) {
+			return nil, fmt.Errorf("alitycs: persistence file exceeds the configured event limit (%d)", maxPendingEvents)
+		}
 	}
 	return store, nil
 }
@@ -61,11 +78,25 @@ func (s *fileBatchStore) put(record durableBatchRecord) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.records[record.BatchID]; !exists {
-		s.order = append(s.order, record.BatchID)
+	if existing, exists := s.records[record.BatchID]; exists {
+		if existing == record {
+			return nil
+		}
+		return fmt.Errorf("alitycs: persistence batch id collision %q", record.BatchID)
 	}
+	if record.EventCount < 1 || s.pending.Load()+int64(record.EventCount) > int64(s.maxPendingEvents) {
+		return fmt.Errorf("alitycs: persistence event limit exceeded (%d)", s.maxPendingEvents)
+	}
+	s.order = append(s.order, record.BatchID)
 	s.records[record.BatchID] = record
-	return s.writeLocked()
+	s.pending.Add(int64(record.EventCount))
+	if err := s.writeLocked(); err != nil {
+		delete(s.records, record.BatchID)
+		s.order = s.order[:len(s.order)-1]
+		s.pending.Add(-int64(record.EventCount))
+		return err
+	}
+	return nil
 }
 
 func (s *fileBatchStore) acknowledge(batchID string) error {
@@ -74,14 +105,31 @@ func (s *fileBatchStore) acknowledge(batchID string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	record, exists := s.records[batchID]
+	if !exists {
+		return nil
+	}
 	delete(s.records, batchID)
+	removedIndex := -1
 	for index, existing := range s.order {
 		if existing == batchID {
+			removedIndex = index
 			s.order = append(s.order[:index], s.order[index+1:]...)
 			break
 		}
 	}
-	return s.writeLocked()
+	s.pending.Add(-int64(record.EventCount))
+	if err := s.writeLocked(); err != nil {
+		s.records[batchID] = record
+		if removedIndex >= 0 {
+			s.order = append(s.order, "")
+			copy(s.order[removedIndex+1:], s.order[removedIndex:])
+			s.order[removedIndex] = batchID
+		}
+		s.pending.Add(int64(record.EventCount))
+		return err
+	}
+	return nil
 }
 
 func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
@@ -94,9 +142,14 @@ func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
 	if !ok {
 		return nil
 	}
+	previous := record
 	record.PausedUntilMS = untilMS
 	s.records[batchID] = record
-	return s.writeLocked()
+	if err := s.writeLocked(); err != nil {
+		s.records[batchID] = previous
+		return err
+	}
+	return nil
 }
 
 func (s *fileBatchStore) snapshot() []durableBatchRecord {
@@ -118,13 +171,7 @@ func (s *fileBatchStore) pendingEvents() int {
 	if !s.enabled() {
 		return 0
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	total := 0
-	for _, record := range s.records {
-		total += record.EventCount
-	}
-	return total
+	return int(s.pending.Load())
 }
 
 func (s *fileBatchStore) writeLocked() error {
@@ -132,6 +179,7 @@ func (s *fileBatchStore) writeLocked() error {
 		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("alitycs: remove empty persistence file: %w", err)
 		}
+		syncDirectoryBestEffort(filepath.Dir(s.path))
 		return nil
 	}
 	directory := filepath.Dir(s.path)
@@ -167,5 +215,15 @@ func (s *fileBatchStore) writeLocked() error {
 	if err := os.Rename(temporaryPath, s.path); err != nil {
 		return fmt.Errorf("alitycs: replace persistence state: %w", err)
 	}
+	syncDirectoryBestEffort(directory)
 	return nil
+}
+
+func syncDirectoryBestEffort(directory string) {
+	handle, err := os.Open(directory)
+	if err != nil {
+		return
+	}
+	defer handle.Close()
+	_ = handle.Sync()
 }

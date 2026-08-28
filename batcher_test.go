@@ -3,6 +3,7 @@ package alitycs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -334,6 +335,35 @@ func TestBatcherWholeBatch400SplitsAndDeliversSingles(t *testing.T) {
 	counters := b.counters()
 	if counters.Delivered != 4 || counters.Failed != 0 {
 		t.Fatalf("counters = %+v, want 4 delivered and none failed", counters)
+	}
+}
+
+func TestBatcherWholeBatch400SplitIsBounded(t *testing.T) {
+	sender := &fakeSend{}
+	send := func(ctx context.Context, payload *BatchPayload) error {
+		if err := sender.send(ctx, payload); err != nil {
+			return err
+		}
+		return &terminalStatusError{status: batchRejectStatus}
+	}
+	b := newTestBatcher(100, 100, send)
+	go b.loop()
+	defer func() { b.stop(); <-b.doneCh }()
+
+	for index := 0; index < 100; index++ {
+		if !b.enqueue(testEvent(fmt.Sprintf("event-%d", index)), context.Background()) {
+			t.Fatal("enqueue rejected within budget")
+		}
+	}
+	if err := b.flush(context.Background()); err == nil {
+		t.Fatal("bounded split unexpectedly reported success")
+	}
+	if got := len(sender.batches()); got != maxSplitSends {
+		t.Fatalf("split sent %d requests, want cap %d", got, maxSplitSends)
+	}
+	counters := b.counters()
+	if counters.Failed != 100 || b.unsent.Load() != 0 {
+		t.Fatalf("counters = %+v, unsent = %d; want 100 failed and 0 unsent", counters, b.unsent.Load())
 	}
 }
 

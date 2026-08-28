@@ -15,7 +15,7 @@ import (
 
 func TestFileBatchStoreLifecycle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "wal.json")
-	store, err := newFileBatchStore(path)
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestFileBatchStoreLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	restarted, err := newFileBatchStore(path)
+	restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,8 +57,57 @@ func TestFileBatchStoreRejectsCorruptState(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not-json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newFileBatchStore(path); err == nil {
+	if _, err := newFileBatchStore(path, defaultMaxQueueSize); err == nil {
 		t.Fatal("corrupt state must fail initialization")
+	}
+}
+
+func TestFileBatchStoreBoundsPendingEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(durableBatchRecord{BatchID: "batch_full", Body: "{}", EventCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(durableBatchRecord{BatchID: "batch_overflow", Body: "{}", EventCount: 1}); err == nil {
+		t.Fatal("put beyond persistence event limit succeeded")
+	}
+	if got := store.pendingEvents(); got != 2 {
+		t.Fatalf("pending = %d, want 2", got)
+	}
+	if _, err := newFileBatchStore(path, 1); err == nil {
+		t.Fatal("restart below persisted event count succeeded")
+	}
+}
+
+func TestFileBatchStoreRollsBackMemoryAfterWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := durableBatchRecord{BatchID: "batch_exact", Body: "{}", EventCount: 1}
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+	store.path = t.TempDir() // rename over an existing directory must fail
+	if err := store.pause(record.BatchID, 123); err == nil {
+		t.Fatal("pause unexpectedly succeeded")
+	}
+	snapshot := store.snapshot()
+	if len(snapshot) != 1 || snapshot[0].PausedUntilMS != 0 {
+		t.Fatalf("failed pause changed memory: %#v", snapshot)
+	}
+	if err := os.WriteFile(filepath.Join(store.path, "marker"), []byte("keep directory non-empty"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.acknowledge(record.BatchID); err == nil {
+		t.Fatal("acknowledge unexpectedly succeeded")
+	}
+	if got := store.pendingEvents(); got != 1 {
+		t.Fatalf("failed acknowledge left %d pending, want 1", got)
 	}
 }
 
@@ -77,7 +126,7 @@ func TestTransportRecoversExactPersistedBody(t *testing.T) {
 	defer server.Close()
 
 	path := filepath.Join(t.TempDir(), "wal.json")
-	store, _ := newFileBatchStore(path)
+	store, _ := newFileBatchStore(path, defaultMaxQueueSize)
 	first := newTestTransport(t, server.URL, 0)
 	first.store = store
 	err := first.send(context.Background(), samplePayload())
@@ -86,7 +135,7 @@ func TestTransportRecoversExactPersistedBody(t *testing.T) {
 		t.Fatalf("send error = %v, pending = %d", err, store.pendingEvents())
 	}
 
-	restartedStore, _ := newFileBatchStore(path)
+	restartedStore, _ := newFileBatchStore(path, defaultMaxQueueSize)
 	restarted := newTestTransport(t, server.URL, 0)
 	restarted.store = restartedStore
 	if err := restarted.recover(context.Background()); err != nil {
@@ -113,14 +162,14 @@ func TestTransportRecoveryHonoursPersistedRetryAfter(t *testing.T) {
 	defer server.Close()
 
 	path := filepath.Join(t.TempDir(), "wal.json")
-	store, _ := newFileBatchStore(path)
+	store, _ := newFileBatchStore(path, defaultMaxQueueSize)
 	first := newTestTransport(t, server.URL, 0)
 	first.store = store
 	if err := first.send(context.Background(), samplePayload()); err == nil {
 		t.Fatal("first 429 must remain pending")
 	}
 
-	restartedStore, _ := newFileBatchStore(path)
+	restartedStore, _ := newFileBatchStore(path, defaultMaxQueueSize)
 	restarted := newTestTransport(t, server.URL, 0)
 	restarted.store = restartedStore
 	var waited time.Duration
