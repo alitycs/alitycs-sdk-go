@@ -48,12 +48,17 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
+	store, err := newFileBatchStore(cfg.persistencePath)
+	if err != nil {
+		return nil, err
+	}
 	t := &transport{
 		endpoint:   cfg.endpoint,
 		apiKey:     cfg.apiKey,
 		maxRetries: cfg.maxRetries,
 		client:     cfg.httpClientOrDefault(),
 		debug:      cfg.debug,
+		store:      store,
 	}
 	c := &Client{
 		config:      cfg,
@@ -61,7 +66,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		sessions:    newSessionManager(cfg.sessionTimeout),
 		globals:     make(Props),
 	}
-	c.batch = newBatcher(cfg, t.send)
+	c.batch = newBatcher(cfg, t.send, t.recover, store.pendingEvents, store.enabled())
 	c.batch.start()
 	return c, nil
 }

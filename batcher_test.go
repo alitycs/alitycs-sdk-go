@@ -37,7 +37,7 @@ func newTestBatcher(flushSize, queueLimit int, send func(ctx context.Context, pa
 		flushSize:     flushSize,
 		flushInterval: 0,
 		maxQueueSize:  queueLimit,
-	}, send)
+	}, send, func(context.Context) error { return nil }, func() int { return 0 }, false)
 }
 
 func testEvent(name string) Event {

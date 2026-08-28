@@ -23,6 +23,7 @@ type transport struct {
 	maxRetries int
 	client     *http.Client
 	debug      bool
+	store      *fileBatchStore
 
 	// backoff overrides the retry schedule; tests use it to avoid real
 	// sleeps. nil means the production schedule.
@@ -46,6 +47,57 @@ func (t *transport) send(ctx context.Context, payload *BatchPayload) error {
 		return fmt.Errorf("alitycs: encode batch: %w", err)
 	}
 
+	record := durableBatchRecord{
+		BatchID: payload.BatchID, Body: string(body), EventCount: len(payload.Events),
+	}
+	if err := t.store.put(record); err != nil {
+		return err
+	}
+	err = t.sendRecord(ctx, record)
+	if err != nil && t.store.enabled() {
+		return &durableBatchError{cause: err}
+	}
+	return err
+}
+
+// durableBatchError proves the exact body is already owned by the WAL.
+type durableBatchError struct{ cause error }
+
+func (e *durableBatchError) Error() string { return e.cause.Error() }
+func (e *durableBatchError) Unwrap() error { return e.cause }
+
+type retryAfterError struct {
+	cause   error
+	untilMS int64
+}
+
+func (e *retryAfterError) Error() string { return e.cause.Error() }
+func (e *retryAfterError) Unwrap() error { return e.cause }
+
+func (t *transport) recover(ctx context.Context) error {
+	for _, record := range t.store.snapshot() {
+		if remaining := time.Until(time.UnixMilli(record.PausedUntilMS)); record.PausedUntilMS > 0 && remaining > 0 {
+			sleepFn := t.sleep
+			if sleepFn == nil {
+				sleepFn = sleepContext
+			}
+			if err := sleepFn(ctx, remaining); err != nil {
+				return err
+			}
+		}
+		if err := t.sendRecord(ctx, record); err != nil {
+			var terminal *terminalStatusError
+			if errors.As(err, &terminal) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) error {
+	body := []byte(record.Body)
 	var lastErr error
 	retryAfter := time.Duration(0)
 	hasRetryAfter := false
@@ -68,17 +120,31 @@ func (t *transport) send(ctx context.Context, payload *BatchPayload) error {
 
 		suggested, suggestedOK, err := t.post(ctx, body)
 		if err == nil {
+			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
+				return storeErr
+			}
 			return nil
 		}
 		lastErr = err
 		retryAfter, hasRetryAfter = suggested, suggestedOK
 		if errors.Is(err, errTerminalStatus) {
+			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
+				return storeErr
+			}
 			t.debugf("%v — not retrying", err)
 			return err
 		}
 	}
 
-	return fmt.Errorf("alitycs: all %d retries exhausted: %w", t.maxRetries, lastErr)
+	wrapped := fmt.Errorf("alitycs: all %d retries exhausted: %w", t.maxRetries, lastErr)
+	untilMS := int64(0)
+	if hasRetryAfter {
+		untilMS = time.Now().Add(retryAfter).UnixMilli()
+	}
+	if err := t.store.pause(record.BatchID, untilMS); err != nil {
+		return err
+	}
+	return &retryAfterError{cause: wrapped, untilMS: untilMS}
 }
 
 var errTerminalStatus = errors.New("terminal status")

@@ -64,11 +64,14 @@ type batcher struct {
 	stopCh        chan struct{}
 	doneCh        chan struct{}
 
-	send       func(ctx context.Context, payload *BatchPayload) error
-	flushSize  int
-	interval   time.Duration
-	queueLimit int
-	debug      bool
+	send           func(ctx context.Context, payload *BatchPayload) error
+	recover        func(ctx context.Context) error
+	durablePending func() int
+	durable        bool
+	flushSize      int
+	interval       time.Duration
+	queueLimit     int
+	debug          bool
 
 	enqueued  atomic.Int64 // accepted into the queue
 	delivered atomic.Int64 // accepted by the endpoint
@@ -81,17 +84,26 @@ type batcher struct {
 	lastCause error   // most recent send failure; read only after doneCh closes
 }
 
-func newBatcher(cfg *config, send func(ctx context.Context, payload *BatchPayload) error) *batcher {
+func newBatcher(
+	cfg *config,
+	send func(ctx context.Context, payload *BatchPayload) error,
+	recoverFn func(ctx context.Context) error,
+	durablePending func() int,
+	durable bool,
+) *batcher {
 	return &batcher{
-		events:        make(chan inbound, cfg.maxQueueSize),
-		flushRequests: make(chan flushRequest, defaultMaxQueueSize),
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		send:          send,
-		flushSize:     cfg.flushSize,
-		interval:      cfg.flushInterval,
-		queueLimit:    cfg.maxQueueSize,
-		debug:         cfg.debug,
+		events:         make(chan inbound, cfg.maxQueueSize),
+		flushRequests:  make(chan flushRequest, defaultMaxQueueSize),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		send:           send,
+		recover:        recoverFn,
+		durablePending: durablePending,
+		durable:        durable,
+		flushSize:      cfg.flushSize,
+		interval:       cfg.flushInterval,
+		queueLimit:     cfg.maxQueueSize,
+		debug:          cfg.debug,
 	}
 }
 
@@ -164,6 +176,9 @@ func (b *batcher) stop() {
 func (b *batcher) waitDone(ctx context.Context) error {
 	select {
 	case <-b.doneCh:
+		if pending := b.durablePending(); pending > 0 {
+			return &UndeliveredError{Undelivered: pending, Cause: b.lastCause}
+		}
 		failed := b.failed.Load()
 		rejected := b.rejected.Load()
 		if failed > 0 || rejected > 0 {
@@ -232,6 +247,10 @@ func (b *batcher) loop() {
 				// events stream in; anything extra waits its turn. The
 				// send answers to the call that completed the batch —
 				// its ctx can cancel or deadline the dispatch.
+				if err := b.recover(in.ctx); err != nil {
+					b.lastCause = err
+					break
+				}
 				chunk := b.pending[:b.flushSize]
 				b.pending = b.pending[b.flushSize:]
 				b.sendChunk(in.ctx, chunk)
@@ -250,6 +269,10 @@ func (b *batcher) loop() {
 // finish drains everything still queued after stop and sends it in batches of
 // flushSize. Losses are counted by sendChunk and reported through waitDone.
 func (b *batcher) finish(ctx context.Context) {
+	if err := b.recover(ctx); err != nil {
+		b.lastCause = err
+		return
+	}
 	for {
 		b.drainChannel()
 		if len(b.pending) == 0 {
@@ -286,6 +309,10 @@ func (b *batcher) drainChannel() {
 // empty queue sends nothing; flushes never fabricate empty requests. The
 // first terminal failure is returned after every chunk has had its turn.
 func (b *batcher) sendPending(ctx context.Context) error {
+	if err := b.recover(ctx); err != nil {
+		b.lastCause = err
+		return err
+	}
 	b.drainChannel()
 	var firstErr error
 	for len(b.pending) > 0 {
@@ -348,9 +375,16 @@ func (b *batcher) deliver(ctx context.Context, events []Event, depth int) error 
 	}
 
 	b.unsent.Add(-int64(len(events)))
-	b.failed.Add(int64(len(events)))
+	var retained *durableBatchError
+	if !errors.As(err, &retained) {
+		b.failed.Add(int64(len(events)))
+	}
 	b.lastCause = err
-	debugLog(b.debug, "batch %s failed after retries — dropping %d events: %v", payload.BatchID, len(events), err)
+	if errors.As(err, &retained) {
+		debugLog(b.debug, "batch %s failed after retries — retaining %d events for restart: %v", payload.BatchID, len(events), err)
+	} else {
+		debugLog(b.debug, "batch %s failed after retries — dropping %d events: %v", payload.BatchID, len(events), err)
+	}
 	return err
 }
 
