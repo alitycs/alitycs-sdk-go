@@ -518,3 +518,60 @@ func TestRecoveredTerminalRejectionCountsAsFailedAndLeavesNoWALRecord(t *testing
 		t.Fatalf("terminal recovery left WAL behind: %v", err)
 	}
 }
+
+func TestShutdownDeadlineIncludesRecoveredWALRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := durableRecord(samplePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-unblock
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	released := false
+	defer func() {
+		if !released {
+			close(unblock)
+		}
+	}()
+	client, err := New(
+		"pk_test",
+		WithEndpoint(server.URL),
+		WithFlushInterval(0),
+		WithMaxRetries(0),
+		WithPersistence(path),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	shutdownErr := client.Shutdown(ctx)
+	select {
+	case <-started:
+	default:
+		t.Fatal("shutdown deadline elapsed before recovery reached the endpoint")
+	}
+	var undelivered *UndeliveredError
+	if !errors.As(shutdownErr, &undelivered) || undelivered.Undelivered != 1 {
+		t.Fatalf("Shutdown = %v, want UndeliveredError with one recovered WAL event", shutdownErr)
+	}
+	close(unblock)
+	released = true
+	if err := client.Shutdown(context.Background()); err != nil {
+		t.Fatalf("completed Shutdown: %v", err)
+	}
+}

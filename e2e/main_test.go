@@ -29,7 +29,10 @@ func TestRunPersistsFailedPhaseAndReplaysOnRestart(t *testing.T) {
 	failureBodies := make(chan string, 4)
 	failureServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		failureBodies <- string(body)
+		select {
+		case failureBodies <- string(body):
+		default: // the test only inspects the first failed request
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer failureServer.Close()

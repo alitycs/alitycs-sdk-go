@@ -81,6 +81,13 @@ type batcher struct {
 	failed    atomic.Int64 // exhausted retries in a background send
 	unsent    atomic.Int64 // in the channel or in pending, awaiting an outcome
 
+	// recoveryOwned tracks the still-pending events loaded when this process
+	// started. recoveryFailed is the subset of Failed originating outside this
+	// process, so shutdown deadline reporting can count unique current and
+	// restart-owned events without double-counting either group.
+	recoveryOwned  atomic.Int64
+	recoveryFailed atomic.Int64
+
 	pending   []Event // owned by the loop goroutine only
 	lastCause error   // most recent send failure; read only after doneCh closes
 }
@@ -93,7 +100,7 @@ func newBatcher(
 	durablePending func() int,
 	durable bool,
 ) *batcher {
-	return &batcher{
+	b := &batcher{
 		events:         make(chan inbound, cfg.maxQueueSize),
 		flushRequests:  make(chan flushRequest, defaultMaxQueueSize),
 		stopCh:         make(chan struct{}),
@@ -108,6 +115,8 @@ func newBatcher(
 		queueLimit:     cfg.maxQueueSize,
 		debug:          cfg.debug,
 	}
+	b.recoveryOwned.Store(int64(durablePending()))
+	return b
 }
 
 // start launches the loop goroutine.
@@ -203,7 +212,7 @@ func (b *batcher) waitDone(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return &UndeliveredError{
-			Undelivered: int(b.enqueued.Load() - b.delivered.Load()),
+			Undelivered: b.undeliveredAtDeadline(),
 			Cause:       ctx.Err(),
 		}
 	}
@@ -381,6 +390,7 @@ func (b *batcher) sendPending(ctx context.Context) error {
 // deferred or transient recovery errors preserve WAL-first delivery ordering.
 func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocked error) {
 	err := b.recover(ctx)
+	b.updateRecoveryOwned()
 	if err == nil {
 		return nil, nil
 	}
@@ -388,11 +398,31 @@ func (b *batcher) recoverBeforeSend(ctx context.Context) (reported error, blocke
 	var outcome *recoveryOutcomeError
 	if errors.As(err, &outcome) {
 		b.failed.Add(outcome.Lost)
+		b.recoveryFailed.Add(outcome.Lost)
 		if !outcome.Blocked {
 			return err, nil
 		}
 	}
 	return nil, err
+}
+
+func (b *batcher) updateRecoveryOwned() {
+	remaining := int64(b.durablePending())
+	for {
+		owned := b.recoveryOwned.Load()
+		if remaining >= owned || b.recoveryOwned.CompareAndSwap(owned, remaining) {
+			return
+		}
+	}
+}
+
+func (b *batcher) undeliveredAtDeadline() int {
+	currentFailed := b.failed.Load() - b.recoveryFailed.Load()
+	currentOutstanding := b.enqueued.Load() - b.delivered.Load() - currentFailed
+	if currentOutstanding < 0 {
+		currentOutstanding = 0
+	}
+	return int(b.recoveryOwned.Load() + currentOutstanding)
 }
 
 // maxSplitSends bounds whole-batch rejection isolation so one response cannot

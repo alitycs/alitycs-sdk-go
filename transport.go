@@ -186,6 +186,8 @@ func (t *transport) sendRecord(ctx context.Context, record durableBatchRecord) e
 		suggested, suggestedOK, err := t.post(ctx, body)
 		if err == nil {
 			if storeErr := t.store.acknowledge(record.BatchID); storeErr != nil {
+				warnLog("batch %s was accepted but its WAL acknowledgement failed (%v) — replay may occur after restart",
+					record.BatchID, storeErr)
 				return storeErr
 			}
 			return nil
