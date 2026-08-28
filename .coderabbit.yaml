@@ -54,6 +54,12 @@ reviews:
       instructions: >-
         Preserve the minimum supported Go version and avoid unnecessary dependencies. Reject
         replace directives or mutable pseudo-versions without an explicit release rationale.
+    - path: "go.sum"
+      instructions: >-
+        Treat checksum changes as supply-chain-sensitive. Require a module-graph justification,
+        allow documented checksum-only changes for modules already selected by go.mod, reject
+        unexplained module additions or replacements, and require the dependency-review and Snyk
+        Open Source checks to pass for every new direct or transitive dependency.
     - path: ".coderabbit.yaml"
       instructions: >-
         Block changes that disable automatic or incremental review, request-changes behavior,
