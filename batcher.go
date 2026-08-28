@@ -185,11 +185,18 @@ func (b *batcher) stop() {
 func (b *batcher) waitDone(ctx context.Context) error {
 	select {
 	case <-b.doneCh:
-		if pending := b.durablePending(); pending > 0 {
-			return &UndeliveredError{Undelivered: pending, Cause: b.lastCause}
-		}
+		pending := b.durablePending()
 		failed := b.failed.Load()
 		rejected := b.rejected.Load()
+		if pending > 0 && (failed > 0 || rejected > 0) {
+			return errors.Join(
+				&UndeliveredError{Undelivered: pending, Cause: b.lastCause},
+				&LostEventsError{Lost: failed, Rejected: rejected, Cause: b.lastCause},
+			)
+		}
+		if pending > 0 {
+			return &UndeliveredError{Undelivered: pending, Cause: b.lastCause}
+		}
 		if failed > 0 || rejected > 0 {
 			return &LostEventsError{Lost: failed, Rejected: rejected, Cause: b.lastCause}
 		}

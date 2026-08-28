@@ -66,6 +66,9 @@ func run() error {
 		if info.Size() == 0 {
 			return fmt.Errorf("first-phase WAL is empty")
 		}
+		if err := client.Shutdown(context.Background()); err == nil {
+			return fmt.Errorf("first-phase shutdown unexpectedly reported full delivery")
+		}
 		return nil
 	}
 	if phase == "restart" {

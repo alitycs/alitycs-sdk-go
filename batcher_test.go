@@ -210,6 +210,38 @@ func TestBatcherShutdownReportsEventsWhenRecoveryAndPersistenceFail(t *testing.T
 	}
 }
 
+func TestBatcherShutdownReportsRetainedAndLostEventsTogether(t *testing.T) {
+	recoveryErr := errors.New("existing WAL recovery failed")
+	persistenceErr := errors.New("persist pending batch failed")
+	var durablePending atomic.Int64
+	durablePending.Store(1)
+	b := newBatcher(
+		&config{flushSize: 100, maxQueueSize: 100},
+		func(context.Context, *BatchPayload) error { return nil },
+		func(*BatchPayload) error { return persistenceErr },
+		func(context.Context) error { return recoveryErr },
+		func() int { return int(durablePending.Load()) },
+		true,
+	)
+	b.start()
+	for _, name := range []string{"first", "second"} {
+		if !b.enqueue(testEvent(name), context.Background()) {
+			t.Fatalf("enqueue %q rejected within budget", name)
+		}
+	}
+	b.stop()
+
+	err := b.waitDone(context.Background())
+	var undelivered *UndeliveredError
+	if !errors.As(err, &undelivered) || undelivered.Undelivered != 1 {
+		t.Fatalf("waitDone = %v, want UndeliveredError with 1 retained event", err)
+	}
+	var lost *LostEventsError
+	if !errors.As(err, &lost) || lost.Lost != 2 || !errors.Is(err, persistenceErr) {
+		t.Fatalf("waitDone = %v, want LostEventsError with 2 lost events", err)
+	}
+}
+
 func TestBatcherBudgetRejectsBeyondLimit(t *testing.T) {
 	sender := &fakeSend{}
 	b := newTestBatcher(100, 2, sender.send) // no loop started: nothing drains

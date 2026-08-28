@@ -48,7 +48,8 @@ here before a version tag is created.
   includes retained durable events in the budget.
 - Terminal rejections of persisted single events now count in `Stats().Failed` and
   `LostEventsError` after their WAL records are removed; shutdown reports any accepted events that
-  cannot be appended to the WAL after a recovery failure.
+  cannot be appended to the WAL after a recovery failure. When retained and permanently lost
+  events coexist, the returned error exposes both `UndeliveredError` and `LostEventsError`.
 
 [Unreleased]: https://github.com/alitycs/alitycs-sdk-go/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/alitycs/alitycs-sdk-go/releases/tag/v1.0.0

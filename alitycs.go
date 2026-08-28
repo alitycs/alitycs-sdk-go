@@ -211,15 +211,15 @@ type Stats struct {
 	Failed    int64
 }
 
-// UndeliveredError reports events that had not been confirmed delivered when
-// a shutdown deadline expired.
+// UndeliveredError reports events retained for a later restart or not yet
+// confirmed when a shutdown deadline expired.
 type UndeliveredError struct {
 	Undelivered int
 	Cause       error
 }
 
 func (e *UndeliveredError) Error() string {
-	return fmt.Sprintf("alitycs: shutdown deadline exceeded with %d events not yet delivered: %v", e.Undelivered, e.Cause)
+	return fmt.Sprintf("alitycs: shutdown left %d events not yet delivered: %v", e.Undelivered, e.Cause)
 }
 
 func (e *UndeliveredError) Unwrap() error { return e.Cause }
