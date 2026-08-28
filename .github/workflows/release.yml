@@ -39,7 +39,7 @@ jobs:
           [[ "$tag_commit" == "$GITHUB_SHA" ]]
           main_commit="$(git rev-parse refs/remotes/origin/main^{commit})"
           git merge-base --is-ancestor "$tag_commit" "$main_commit"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           sdk_version="$(awk -F'"' '/Version = / { print $2; exit }' doc.go)"
           [[ "$GITHUB_REF_NAME" == "v${sdk_version}" ]]
           printf 'tag_commit=%s\ntag_object=%s\n' "$tag_commit" "$tag_object" >> "$GITHUB_OUTPUT"
@@ -90,10 +90,6 @@ jobs:
         with:
           name: release-artifacts
           path: release/
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: release/*
       - name: Recheck immutable release tag
         env:
           EXPECTED_TAG_COMMIT: ${{ needs.build.outputs.tag_commit }}
@@ -103,6 +99,10 @@ jobs:
           [[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]
           [[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]
           [[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

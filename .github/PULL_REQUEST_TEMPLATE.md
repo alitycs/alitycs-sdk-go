@@ -12,7 +12,11 @@ Describe the user-visible change and why it is needed.
 
 - [ ] `gofmt -w .`
 - [ ] `go vet ./...`
+- [ ] `go test -race ./...`
 - [ ] `./scripts/check-coverage.sh`
+- [ ] `./scripts/verify-workflow-pins.rb`
+- [ ] `./scripts/validate-coderabbit.sh`
+- [ ] `./scripts/test-coderabbit-policy.rb`
 
 ## Automated review
 
