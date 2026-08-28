@@ -8,6 +8,7 @@ Run these checks before opening a pull request:
 ```bash
 gofmt -w .
 go vet ./...
+go test -race ./...
 ./scripts/check-coverage.sh
 ./scripts/verify-workflow-pins.rb
 ./scripts/validate-coderabbit.sh

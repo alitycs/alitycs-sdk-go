@@ -37,7 +37,7 @@ jobs:
           tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
           [[ "$tag_object" =~ ^[0-9a-f]{40}$ && "$tag_commit" =~ ^[0-9a-f]{40}$ ]]
           [[ "$tag_commit" == "$GITHUB_SHA" ]]
-          main_commit="$(git rev-parse refs/remotes/origin/main^{commit})"
+          main_commit="$(git rev-parse "refs/remotes/origin/main^{commit}")"
           git merge-base --is-ancestor "$tag_commit" "$main_commit"
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           sdk_version="$(awk -F'"' '/Version = / { print $2; exit }' doc.go)"
@@ -90,6 +90,8 @@ jobs:
         with:
           name: release-artifacts
           path: release/
+      - name: Verify artifact checksums
+        run: (cd release && sha256sum --check --strict SHA256SUMS)
       - name: Recheck immutable release tag
         env:
           EXPECTED_TAG_COMMIT: ${{ needs.build.outputs.tag_commit }}
