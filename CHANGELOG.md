@@ -39,8 +39,9 @@ here before a version tag is created.
   fire and batches only left via the timer or explicit Flush/Shutdown. Equal values remain legal.
 - WAL growth is capped by `maxQueueSize`; persisted state above the configured cap fails startup,
   serialized bodies are validated against their outer batch ID and event count, and failed
-  mutations roll back their in-memory state. File contents are fsynced before replace, followed by
-  a required directory fsync on supported platforms.
+  pre-commit mutations roll back their in-memory state while post-commit sync failures retain the
+  disk-equivalent state. File contents are fsynced before replace, followed by required fsyncs for
+  the WAL directory and every newly created parent on supported platforms.
 - HTTP 400 isolation is capped at 64 sends, preventing a large rejected batch from amplifying into
   an unbounded request storm. Concurrent admission now reserves queue capacity atomically and
   includes retained durable events in the budget.

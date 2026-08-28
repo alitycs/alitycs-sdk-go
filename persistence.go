@@ -31,6 +31,7 @@ type fileBatchStore struct {
 	pending          atomic.Int64
 	records          map[string]durableBatchRecord
 	order            []string
+	syncDir          func(string) error
 }
 
 func newFileBatchStore(path string, maxPendingEvents int) (*fileBatchStore, error) {
@@ -39,6 +40,7 @@ func newFileBatchStore(path string, maxPendingEvents int) (*fileBatchStore, erro
 	}
 	store := &fileBatchStore{
 		path: path, maxPendingEvents: maxPendingEvents, records: make(map[string]durableBatchRecord),
+		syncDir: syncDirectory,
 	}
 	if path == "" {
 		return store, nil
@@ -108,13 +110,13 @@ func (s *fileBatchStore) put(record durableBatchRecord) error {
 	s.order = append(s.order, record.BatchID)
 	s.records[record.BatchID] = record
 	s.pending.Add(int64(record.EventCount))
-	if err := s.writeLocked(); err != nil {
+	committed, err := s.writeLocked()
+	if err != nil && !committed {
 		delete(s.records, record.BatchID)
 		s.order = s.order[:len(s.order)-1]
 		s.pending.Add(-int64(record.EventCount))
-		return err
 	}
-	return nil
+	return err
 }
 
 func (s *fileBatchStore) acknowledge(batchID string) error {
@@ -137,7 +139,8 @@ func (s *fileBatchStore) acknowledge(batchID string) error {
 		}
 	}
 	s.pending.Add(-int64(record.EventCount))
-	if err := s.writeLocked(); err != nil {
+	committed, err := s.writeLocked()
+	if err != nil && !committed {
 		s.records[batchID] = record
 		if removedIndex >= 0 {
 			s.order = append(s.order, "")
@@ -145,9 +148,8 @@ func (s *fileBatchStore) acknowledge(batchID string) error {
 			s.order[removedIndex] = batchID
 		}
 		s.pending.Add(int64(record.EventCount))
-		return err
 	}
-	return nil
+	return err
 }
 
 func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
@@ -163,11 +165,11 @@ func (s *fileBatchStore) pause(batchID string, untilMS int64) error {
 	previous := record
 	record.PausedUntilMS = untilMS
 	s.records[batchID] = record
-	if err := s.writeLocked(); err != nil {
+	committed, err := s.writeLocked()
+	if err != nil && !committed {
 		s.records[batchID] = previous
-		return err
 	}
-	return nil
+	return err
 }
 
 func (s *fileBatchStore) snapshot() []durableBatchRecord {
@@ -192,19 +194,23 @@ func (s *fileBatchStore) pendingEvents() int {
 	return int(s.pending.Load())
 }
 
-func (s *fileBatchStore) writeLocked() error {
+func (s *fileBatchStore) writeLocked() (bool, error) {
 	if len(s.records) == 0 {
-		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("alitycs: remove empty persistence file: %w", err)
+		err := os.Remove(s.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return true, nil
+			}
+			return false, fmt.Errorf("alitycs: remove empty persistence file: %w", err)
 		}
-		if err := syncDirectory(filepath.Dir(s.path)); err != nil {
-			return err
+		if err := s.syncDir(filepath.Dir(s.path)); err != nil {
+			return true, err
 		}
-		return nil
+		return true, nil
 	}
 	directory := filepath.Dir(s.path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("alitycs: create persistence directory: %w", err)
+	if err := ensureDurableDirectory(directory, s.syncDir); err != nil {
+		return false, err
 	}
 	batches := make([]durableBatchRecord, 0, len(s.records))
 	for _, batchID := range s.order {
@@ -214,11 +220,11 @@ func (s *fileBatchStore) writeLocked() error {
 	}
 	raw, err := json.Marshal(durableBatchState{Version: 1, Batches: batches})
 	if err != nil {
-		return fmt.Errorf("alitycs: encode persistence state: %w", err)
+		return false, fmt.Errorf("alitycs: encode persistence state: %w", err)
 	}
 	temporary, err := os.CreateTemp(directory, ".alitycs-wal-*")
 	if err != nil {
-		return fmt.Errorf("alitycs: create persistence temp file: %w", err)
+		return false, fmt.Errorf("alitycs: create persistence temp file: %w", err)
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
@@ -230,13 +236,43 @@ func (s *fileBatchStore) writeLocked() error {
 		err = closeErr
 	}
 	if err != nil {
-		return fmt.Errorf("alitycs: write persistence state: %w", err)
+		return false, fmt.Errorf("alitycs: write persistence state: %w", err)
 	}
 	if err := os.Rename(temporaryPath, s.path); err != nil {
-		return fmt.Errorf("alitycs: replace persistence state: %w", err)
+		return false, fmt.Errorf("alitycs: replace persistence state: %w", err)
 	}
-	if err := syncDirectory(directory); err != nil {
-		return err
+	if err := s.syncDir(directory); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func ensureDurableDirectory(directory string, syncDir func(string) error) error {
+	missing := make([]string, 0)
+	for current := filepath.Clean(directory); ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("alitycs: persistence parent is not a directory: %s", current)
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("alitycs: inspect persistence directory: %w", err)
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return fmt.Errorf("alitycs: no existing parent for persistence directory %s", directory)
+		}
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("alitycs: create persistence directory: %w", err)
+	}
+	for index := len(missing) - 1; index >= 0; index-- {
+		if err := syncDir(filepath.Dir(missing[index])); err != nil {
+			return fmt.Errorf("alitycs: sync new persistence directory parent: %w", err)
+		}
 	}
 	return nil
 }

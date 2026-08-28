@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -163,6 +164,113 @@ func TestFileBatchStoreRollsBackMemoryAfterWriteFailure(t *testing.T) {
 	}
 	if got := store.pendingEvents(); got != 1 {
 		t.Fatalf("failed acknowledge left %d pending, want 1", got)
+	}
+}
+
+func TestFileBatchStoreKeepsCommittedMemoryAfterDirectorySyncFailure(t *testing.T) {
+	record := durableBatchRecord{
+		BatchID: "batch_exact", Body: `{"batchId":"batch_exact","events":[{}]}`, EventCount: 1,
+	}
+	syncFailure := errors.New("directory sync failed")
+
+	t.Run("put", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "wal.json")
+		store, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+
+		if err := store.put(record); !errors.Is(err, syncFailure) {
+			t.Fatalf("put error = %v, want %v", err, syncFailure)
+		}
+		if got := store.snapshot(); len(got) != 1 || got[0] != record || store.pendingEvents() != 1 {
+			t.Fatalf("committed put not retained in memory: %#v, pending = %d", got, store.pendingEvents())
+		}
+		restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := restarted.snapshot(); len(got) != 1 || got[0] != record {
+			t.Fatalf("committed put not retained on disk: %#v", got)
+		}
+	})
+
+	t.Run("pause", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "wal.json")
+		store, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.put(record); err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+
+		const pausedUntilMS = int64(123456)
+		if err := store.pause(record.BatchID, pausedUntilMS); !errors.Is(err, syncFailure) {
+			t.Fatalf("pause error = %v, want %v", err, syncFailure)
+		}
+		if got := store.snapshot(); len(got) != 1 || got[0].PausedUntilMS != pausedUntilMS {
+			t.Fatalf("committed pause not retained in memory: %#v", got)
+		}
+		restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := restarted.snapshot(); len(got) != 1 || got[0].PausedUntilMS != pausedUntilMS {
+			t.Fatalf("committed pause not retained on disk: %#v", got)
+		}
+	})
+
+	t.Run("acknowledge", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "wal.json")
+		store, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.put(record); err != nil {
+			t.Fatal(err)
+		}
+		store.syncDir = func(string) error { return syncFailure }
+
+		if err := store.acknowledge(record.BatchID); !errors.Is(err, syncFailure) {
+			t.Fatalf("acknowledge error = %v, want %v", err, syncFailure)
+		}
+		if got := store.snapshot(); len(got) != 0 || store.pendingEvents() != 0 {
+			t.Fatalf("committed acknowledge not retained in memory: %#v, pending = %d", got, store.pendingEvents())
+		}
+		restarted, err := newFileBatchStore(path, defaultMaxQueueSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := restarted.snapshot(); len(got) != 0 || restarted.pendingEvents() != 0 {
+			t.Fatalf("committed acknowledge not retained on disk: %#v, pending = %d", got, restarted.pendingEvents())
+		}
+	})
+}
+
+func TestFileBatchStoreSyncsNewDirectoryParents(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "one", "two", "wal.json")
+	store, err := newFileBatchStore(path, defaultMaxQueueSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	store.syncDir = func(path string) error {
+		synced = append(synced, filepath.Clean(path))
+		return nil
+	}
+	record := durableBatchRecord{
+		BatchID: "batch_exact", Body: `{"batchId":"batch_exact","events":[{}]}`, EventCount: 1,
+	}
+	if err := store.put(record); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Clean(root), filepath.Join(root, "one"), filepath.Join(root, "one", "two")}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("synced directories = %#v, want %#v", synced, want)
 	}
 }
 

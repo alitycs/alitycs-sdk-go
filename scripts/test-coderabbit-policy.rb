@@ -123,29 +123,28 @@ unless guard_fails &&
     verify_lines.include?('[[ "$tag_commit" == "$GITHUB_SHA" ]]')
   failures << "release must require annotated tags"
 end
-tag_identity_rechecked = lambda do |lines|
-  fetch_index = lines.index('git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"')
-  object_index = lines.index(
-    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
-  )
-  commit_index = lines.index(
-    '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
-  )
-  sha_index = lines.index('[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]')
-  fetch_index && object_index && commit_index && sha_index &&
-    fetch_index < object_index && object_index < commit_index && commit_index < sha_index
-end
-identity_checks_without_fetch = [
+tag_identity_sequence = [
+  'git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"',
   '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")" == "$EXPECTED_TAG_OBJECT" ]]',
   '[[ "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" == "$EXPECTED_TAG_COMMIT" ]]',
   '[[ "$GITHUB_SHA" == "$EXPECTED_TAG_COMMIT" ]]',
 ]
+tag_identity_rechecked = lambda do |lines|
+  lines.each_cons(tag_identity_sequence.length).any? { |sequence| sequence == tag_identity_sequence }
+end
+release_command = 'gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes'
+release_created_after_recheck = lambda do |lines|
+  expected = tag_identity_sequence + [release_command]
+  lines.each_cons(expected.length).any? { |sequence| sequence == expected }
+end
+identity_checks_without_fetch = tag_identity_sequence.drop(1)
 failures << "local-only tag checks must not count" if tag_identity_rechecked.call(identity_checks_without_fetch)
+interrupted_creation = tag_identity_sequence + ["echo stale-window", release_command]
+failures << "stale tag-check windows must not count" if release_created_after_recheck.call(interrupted_creation)
 unless tag_identity_rechecked.call(recheck_lines)
   failures << "release must recheck immutable tag"
 end
-unless tag_identity_rechecked.call(create_lines) &&
-    create_lines.include?('gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes')
+unless release_created_after_recheck.call(create_lines)
   failures << "release must recheck immutable tag immediately before creation"
 end
 failures << "release workflow must not use concurrency" if release_data.key?("concurrency")
